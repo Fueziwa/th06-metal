@@ -91,6 +91,21 @@ bool MetalBackend::Init()
     }
     this->layer->setDevice(this->device);
 
+    // Configure the CAMetalLayer for presentation. BGRA8Unorm matches the
+    // pipeline color attachment format we'll create in M2. framebufferOnly=YES
+    // enables GPU compression and is fine until ReadPixels (M5) needs readback.
+    // displaySyncEnabled=YES caps presentation to the display refresh rate.
+    this->layer->setPixelFormat(MTL::PixelFormatBGRA8Unorm);
+    this->layer->setMaximumDrawableCount(2);
+    this->layer->setFramebufferOnly(true);
+    this->layer->setDisplaySyncEnabled(true);
+    // Note: metal-cpp's CA::MetalLayer binding does not expose setOpaque in
+    // this version. The layer is opaque in practice for a fullscreen game;
+    // direct-to-display eligibility is not needed for M1's clear-screen check.
+    // drawableSize is set per-frame in SwapBuffers() from the window size, so
+    // resize is handled without a separate windowDidResize: hook (the game
+    // window is fixed at GAME_WINDOW_*_REAL).
+
     // Command queue. The goal doc targeted MTL4::CommandQueue, but MTL4 requires
     // macOS 26 (Tahoe); this dev machine is macOS 15 (Sequoia), where the
     // MTL4 selector throws at runtime. Per user direction, the port uses the
@@ -114,6 +129,26 @@ void MetalBackend::Exit()
     // our reference. The autorelease pool isn't required for release() itself
     // but keeps any transient objects created during teardown clean.
     NS::AutoreleasePool *pool = NS::AutoreleasePool::alloc()->init();
+
+    // Tear down any in-flight frame state first — if Exit() is called mid-frame
+    // (e.g. on error), the encoder/command buffer/drawable must be released
+    // before the device and command queue go away.
+    if (this->currentRenderEncoder != nullptr)
+    {
+        this->currentRenderEncoder->endEncoding();
+        this->currentRenderEncoder->release();
+        this->currentRenderEncoder = nullptr;
+    }
+    if (this->currentCommandBuffer != nullptr)
+    {
+        this->currentCommandBuffer->release();
+        this->currentCommandBuffer = nullptr;
+    }
+    if (this->currentDrawable != nullptr)
+    {
+        this->currentDrawable->release();
+        this->currentDrawable = nullptr;
+    }
 
     if (this->commandQueue != nullptr)
     {
@@ -238,17 +273,26 @@ void MetalBackend::SetDepthFunc(DepthFunc func)
 
 void MetalBackend::SetClearDepth(f32 depth)
 {
-    // STUB(M1): SetClearDepth — render pass clearDepth attachment value
+    this->clearDepth = depth;
 }
 
 void MetalBackend::SetClearColor(f32 r, f32 g, f32 b, f32 a)
 {
-    // STUB(M1): SetClearColor — render pass clearColor attachment value
+    this->clearColor[0] = r;
+    this->clearColor[1] = g;
+    this->clearColor[2] = b;
+    this->clearColor[3] = a;
 }
 
 void MetalBackend::Clear(u32 clearBits)
 {
-    // STUB(M1): Clear — begin render pass with load action Clear
+    // M1: defer the actual clear to SwapBuffers(). The game calls Clear()
+    // multiple times per frame — once with color|depth at frame start, and
+    // mid-frame depth-only clears during the draw chain. Metal can't cheaply
+    // clear mid-pass, so we OR the requested bits and apply them once at pass
+    // open. This is sufficient for M1's "solid color in window" success
+    // criterion. M5 will revisit mid-frame clears if the game needs them.
+    this->pendingClearBits |= clearBits;
 }
 
 GfxTextureHandle MetalBackend::CreateTexture()
@@ -290,5 +334,107 @@ void MetalBackend::Draw(PrimitiveType type, i32 start, i32 count)
 
 void MetalBackend::SwapBuffers()
 {
-    // STUB(M1): SwapBuffers — acquire next drawable, present via command buffer
+    // M1: open the frame's render pass (clearing with the cached values), then
+    // immediately close and present. No draws are recorded yet — this just
+    // verifies the full present pipeline: nextDrawable -> render pass (clear)
+    // -> endEncoding -> presentDrawable -> commit. M3+ will move pass opening
+    // earlier so draws land inside the encoder.
+    NS::AutoreleasePool *pool = NS::AutoreleasePool::alloc()->init();
+
+    // Keep the layer's drawableSize in sync with the window. The game window
+    // is fixed-size, but this is cheap and handles fullscreen transitions.
+    int w = 0, h = 0;
+    SDL_Metal_GetDrawableSize(this->window, &w, &h);
+    if (w > 0 && h > 0)
+    {
+        this->layer->setDrawableSize(CGSizeMake(w, h));
+    }
+
+    // Acquire the drawable for this frame. nextDrawable blocks on the CPU
+    // until a drawable is available from the pool (max 2 in flight).
+    this->currentDrawable = this->layer->nextDrawable();
+    if (this->currentDrawable == nullptr)
+    {
+        utils::DebugPrint2("MetalBackend: nextDrawable returned null");
+        this->pendingClearBits = 0;
+        pool->drain();
+        return;
+    }
+
+    this->currentCommandBuffer = this->commandQueue->commandBuffer();
+    this->currentCommandBuffer->setLabel(NS::String::string("th06 frame", NS::UTF8StringEncoding));
+
+    MTL::RenderPassDescriptor *desc = MTL::RenderPassDescriptor::renderPassDescriptor();
+    desc->setRenderTargetWidth((NS::UInteger)w);
+    desc->setRenderTargetHeight((NS::UInteger)h);
+
+    // Color attachment 0 = the drawable's texture. Load=Clear bakes the clear
+    // value into the pass; Store=Store writes the result back for presentation.
+    // If no color clear was requested this frame, Load=Load preserves prior
+    // contents (M1 always clears color, so this branch is mostly defensive).
+    MTL::RenderPassColorAttachmentDescriptor *colorAtt = desc->colorAttachments()->object(0);
+    colorAtt->setTexture(this->currentDrawable->texture());
+    if (this->pendingClearBits & CLEAR_COLOR_BUFFER)
+    {
+        colorAtt->setLoadAction(MTL::LoadActionClear);
+        colorAtt->setClearColor(MTL::ClearColor::Make(this->clearColor[0], this->clearColor[1],
+                                                        this->clearColor[2], this->clearColor[3]));
+    }
+    else
+    {
+        colorAtt->setLoadAction(MTL::LoadActionLoad);
+    }
+    colorAtt->setStoreAction(MTL::StoreActionStore);
+
+    // Depth attachment. M1 has no depth-stencil pipeline yet, but the game
+    // clears depth every frame, so allocate a Private depth texture sized to
+    // the drawable. M2 will pair this with a real MTLDepthStencilState.
+    // STUB(M2): replace this throwaway depth texture with a persistent one
+    // owned by the backend and resized with the drawable.
+    if (this->pendingClearBits & CLEAR_DEPTH_BUFFER)
+    {
+        MTL::TextureDescriptor *depthDesc = MTL::TextureDescriptor::alloc()->init();
+        depthDesc->setTextureType(MTL::TextureType2D);
+        depthDesc->setPixelFormat(MTL::PixelFormatDepth32Float);
+        depthDesc->setWidth((NS::UInteger)w);
+        depthDesc->setHeight((NS::UInteger)h);
+        depthDesc->setStorageMode(MTL::StorageModePrivate);
+        depthDesc->setUsage(MTL::TextureUsageRenderTarget);
+        MTL::Texture *depthTex = this->device->newTexture(depthDesc);
+        depthTex->setLabel(NS::String::string("th06 depth (M1 throwaway)", NS::UTF8StringEncoding));
+        depthDesc->release();
+
+        MTL::RenderPassDepthAttachmentDescriptor *depthAtt = desc->depthAttachment();
+        depthAtt->setTexture(depthTex);
+        depthAtt->setLoadAction(MTL::LoadActionClear);
+        depthAtt->setStoreAction(MTL::StoreActionDontCare);
+        depthAtt->setClearDepth(this->clearDepth);
+        // The depth texture is released when desc is drained below; it lives
+        // only for the duration of this render pass.
+        depthTex->release();
+    }
+
+    this->currentRenderEncoder = this->currentCommandBuffer->renderCommandEncoder(desc);
+    this->currentRenderEncoder->setLabel(NS::String::string("th06 main pass", NS::UTF8StringEncoding));
+    this->currentRenderEncoder->endEncoding();
+    this->currentRenderEncoder->release();
+    this->currentRenderEncoder = nullptr;
+
+    desc->release();
+
+    this->currentCommandBuffer->presentDrawable(this->currentDrawable);
+    this->currentCommandBuffer->commit();
+
+    // Release per-frame state. The drawable's backing texture is now owned by
+    // the command buffer until it completes; releasing our reference here lets
+    // the layer recycle the drawable.
+    this->currentCommandBuffer->release();
+    this->currentCommandBuffer = nullptr;
+    this->currentDrawable->release();
+    this->currentDrawable = nullptr;
+
+    // Reset for the next frame.
+    this->pendingClearBits = 0;
+
+    pool->drain();
 }

@@ -9,10 +9,14 @@ namespace MTL
 {
 class Device;
 class CommandQueue;
+class CommandBuffer;
+class RenderCommandEncoder;
+class RenderPassDescriptor;
 }
 namespace CA
 {
 class MetalLayer;
+class MetalDrawable;
 }
 
 // metal-cpp Metal backend for th06.
@@ -88,6 +92,26 @@ struct MetalBackend : GfxInterface
     CA::MetalLayer *layer = nullptr;
     MTL::Device *device = nullptr;
     MTL::CommandQueue *commandQueue = nullptr;
+
+    // Per-frame presentation state. The frame is opened lazily in SwapBuffers()
+    // (which acquires the drawable, opens a render pass with the cached clear
+    // values, and immediately closes+presents). M1 only clears — no draw calls
+    // are recorded yet. M3+ will open the pass earlier (in Clear or a dedicated
+    // BeginFrame) so draws can be recorded into the encoder before present.
+    CA::MetalDrawable *currentDrawable = nullptr;
+    MTL::CommandBuffer *currentCommandBuffer = nullptr;
+    MTL::RenderCommandEncoder *currentRenderEncoder = nullptr;
+
+    // Cached clear values. SetClearColor/SetClearDepth store here; SwapBuffers()
+    // bakes them into the render pass descriptor's load action. Stored as raw
+    // floats because MTL::ClearColor is a struct that needs the full metal-cpp
+    // header.
+    f32 clearColor[4] = {0, 0, 0, 1};
+    double clearDepth = 1.0;
+    // OR of CLEAR_* bits requested since the last present. SwapBuffers() only
+    // clears attachments whose bit is set; the game's per-frame
+    // Clear(color|depth) sets both, and mid-frame depth-only clears OR in.
+    u32 pendingClearBits = 0;
 
     // Next texture id to hand out from CreateTexture(). M4 will replace this
     // with a real texture pool keyed by id.
