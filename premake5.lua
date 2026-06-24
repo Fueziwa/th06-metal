@@ -72,6 +72,7 @@ project "th06"
     "src/graphics/FixedFunctionGL.cpp",
     "src/graphics/WebGL.cpp",
     "src/graphics/Software.cpp",
+    "src/graphics/MetalBackend.cpp",
     "src/pbg3/FileAbstraction.cpp",
     "src/pbg3/IPbg3Parser.cpp",
     "src/pbg3/Pbg3Archive.cpp",
@@ -86,6 +87,19 @@ project "th06"
 
   filter "toolset:gcc"   buildoptions { "-Wall", "-Wextra", "-Wpedantic", "-fjump-tables" }
   filter "toolset:clang" buildoptions { "-Wall", "-Wextra", "-Wpedantic", "-Wno-gnu-anonymous-struct" }
+  filter {}
+
+  -- metal-cpp single-header include path. The single header brings in
+  -- Foundation + Metal + QuartzCore bindings; we still link the system
+  -- frameworks for the objc selectors it calls into.
+  filter "system:macosx"
+    includedirs { "src/thirdparty" }
+    links {
+      "Metal.framework",
+      "MetalKit.framework",
+      "QuartzCore.framework",
+      "Foundation.framework",
+    }
   filter {}
 
   kind "WindowedApp"

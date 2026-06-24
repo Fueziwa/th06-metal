@@ -7,6 +7,7 @@
 #include "Supervisor.hpp"
 #include "ZunMath.hpp"
 #include "graphics/FixedFunctionGL.hpp"
+#include "graphics/MetalBackend.hpp"
 #include "graphics/Software.hpp"
 #include "graphics/WebGL.hpp"
 #include "i18n.hpp"
@@ -27,7 +28,8 @@ static const struct
 {
     const char *name;
     GfxInterface *(*TryInit)();
-} s_RenderBackends[] = {{"GL 2.1 / GL ES 2.0 / WebGL", WebGL::Create},
+} s_RenderBackends[] = {{"Metal (metal-cpp)", MetalBackend::Create},
+                        {"GL 2.1 / GL ES 2.0 / WebGL", WebGL::Create},
                         {"Fixed function GL(ES)", FixedFunctionGL::Init},
                         {"Software fallback (VERY SLOW)", Software::Init}};
 
