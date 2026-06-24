@@ -131,24 +131,17 @@ void MetalBackend::Exit()
     NS::AutoreleasePool *pool = NS::AutoreleasePool::alloc()->init();
 
     // Tear down any in-flight frame state first — if Exit() is called mid-frame
-    // (e.g. on error), the encoder/command buffer/drawable must be released
-    // before the device and command queue go away.
+    // (e.g. on error), the encoder/command buffer/drawable must be dropped
+    // before the device and command queue go away. These are autoreleased (+0)
+    // objects captured during the frame; do NOT release() them — the pool
+    // drain below handles it. Just end any open encoding and clear the slots.
     if (this->currentRenderEncoder != nullptr)
     {
         this->currentRenderEncoder->endEncoding();
-        this->currentRenderEncoder->release();
         this->currentRenderEncoder = nullptr;
     }
-    if (this->currentCommandBuffer != nullptr)
-    {
-        this->currentCommandBuffer->release();
-        this->currentCommandBuffer = nullptr;
-    }
-    if (this->currentDrawable != nullptr)
-    {
-        this->currentDrawable->release();
-        this->currentDrawable = nullptr;
-    }
+    this->currentCommandBuffer = nullptr;
+    this->currentDrawable = nullptr;
 
     if (this->commandQueue != nullptr)
     {
@@ -414,13 +407,17 @@ void MetalBackend::SwapBuffers()
         depthTex->release();
     }
 
+    // renderCommandEncoder() returns an autoreleased (+0) object — do NOT
+    // release() it; the frame pool's drain() handles it. Keeping a raw
+    // pointer within pool scope is the correct lifetime model.
     this->currentRenderEncoder = this->currentCommandBuffer->renderCommandEncoder(desc);
     this->currentRenderEncoder->setLabel(NS::String::string("th06 main pass", NS::UTF8StringEncoding));
     this->currentRenderEncoder->endEncoding();
-    this->currentRenderEncoder->release();
     this->currentRenderEncoder = nullptr;
 
-    desc->release();
+    // renderPassDescriptor() returns an autoreleased (+0) object — do NOT
+    // release() it; the frame pool's drain() handles it.
+    desc = nullptr;
 
     this->currentCommandBuffer->presentDrawable(this->currentDrawable);
     this->currentCommandBuffer->commit();
@@ -428,9 +425,10 @@ void MetalBackend::SwapBuffers()
     // Release per-frame state. The drawable's backing texture is now owned by
     // the command buffer until it completes; releasing our reference here lets
     // the layer recycle the drawable.
-    this->currentCommandBuffer->release();
+    //
+    // commandBuffer() and nextDrawable() both return autoreleased (+0)
+    // objects — do NOT release() them, the frame pool's drain() handles it.
     this->currentCommandBuffer = nullptr;
-    this->currentDrawable->release();
     this->currentDrawable = nullptr;
 
     // Reset for the next frame.
