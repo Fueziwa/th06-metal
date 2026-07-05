@@ -2,14 +2,17 @@
 
 #include "GfxInterface.hpp"
 #include <SDL2/SDL.h>
+#include <map>
 
-// Forward declaration for the metal-cpp NS::UInteger typedef. The full
-// metal-cpp single header is only included in MetalBackend.cpp (it's heavy
-// and pulls in Foundation + Metal + QuartzCore); the header just needs the
-// unsigned int type for the depth texture size members.
+// Forward declaration for the metal-cpp NS::UInteger typedef and
+// NS::AutoreleasePool. The full metal-cpp single header is only included in
+// MetalBackend.cpp (it's heavy and pulls in Foundation + Metal + QuartzCore);
+// the header just needs the unsigned int type for the depth texture size
+// members and the AutoreleasePool type for the frame pool member.
 namespace NS
 {
 typedef unsigned long UInteger;
+class AutoreleasePool;
 }
 
 // Forward declarations for metal-cpp types — avoids pulling every Metal header
@@ -31,6 +34,7 @@ class Function;
 class Buffer;
 class Texture;
 class DepthStencilDescriptor;
+class SamplerState;
 }
 namespace CA
 {
@@ -57,6 +61,38 @@ struct MetalUniforms
     f32       fogNear;               // UNIFORM_FOG_NEAR
     f32       fogFar;                // UNIFORM_FOG_FAR
 };
+
+// Vertex buffer binding index used by the MSL `stage_in` vertex descriptor.
+// Must match `[[buffer(1)]]` in ff_vertex and the layout()->object(1) config
+// in InitPipeline. Buffer index 0 is reserved for the uniforms struct —
+// splitting them avoids the M2 hazard where the vertex descriptor and the
+// uniform buffer both claimed index 0.
+static const NS::UInteger kVertexBufferIndex = 1;
+
+// Uniform buffer binding index (matches `[[buffer(0)]]` in ff_vertex/ff_frag).
+static const NS::UInteger kUniformBufferIndex = 0;
+
+// Signature for a unique vertex layout, used as a PSO cache key. The game
+// interleaves draws with different strides/offsets (VertexTex1Xyzrhw vs
+// VertexTex1DiffuseXyz vs RenderVertexInfo); a single baked PSO can't service
+// them all. We build one PSO per signature and cache by key.
+struct VertexLayoutKey
+{
+    NS::UInteger stride;            // layout(0).stride — bytes between vertices
+    NS::UInteger positionOffset;    // attribute(0).offset
+    NS::UInteger texCoordOffset;    // attribute(1).offset
+    NS::UInteger diffuseOffset;     // attribute(2).offset
+};
+
+// Comparator so VertexLayoutKey can key std::map. Identical layout means the
+// PSO built from it is reusable — memcmp semantics on the struct.
+inline bool operator<(const VertexLayoutKey &a, const VertexLayoutKey &b)
+{
+    if (a.stride != b.stride) return a.stride < b.stride;
+    if (a.positionOffset != b.positionOffset) return a.positionOffset < b.positionOffset;
+    if (a.texCoordOffset != b.texCoordOffset) return a.texCoordOffset < b.texCoordOffset;
+    return a.diffuseOffset < b.diffuseOffset;
+}
 
 // metal-cpp Metal backend for th06.
 //
@@ -132,11 +168,13 @@ struct MetalBackend : GfxInterface
     MTL::Device *device = nullptr;
     MTL::CommandQueue *commandQueue = nullptr;
 
-    // Per-frame presentation state. The frame is opened lazily in SwapBuffers()
-    // (which acquires the drawable, opens a render pass with the cached clear
-    // values, and immediately closes+presents). M1 only clears — no draw calls
-    // are recorded yet. M3+ will open the pass earlier (in Clear or a dedicated
-    // BeginFrame) so draws can be recorded into the encoder before present.
+    // Per-frame presentation state. The frame is opened lazily in BeginFrame()
+    // (called from the first Clear or Draw of the frame) and closed in
+    // SwapBuffers(). The autorelease pool created in BeginFrame lives for the
+    // entire frame — the encoder returned by renderCommandEncoder() is
+    // autoreleased (+0) and would be released prematurely if the pool drained
+    // earlier. SwapBuffers drains it after endEncoding.
+    NS::AutoreleasePool *framePool = nullptr;
     CA::MetalDrawable *currentDrawable = nullptr;
     MTL::CommandBuffer *currentCommandBuffer = nullptr;
     MTL::RenderCommandEncoder *currentRenderEncoder = nullptr;
@@ -165,7 +203,6 @@ struct MetalBackend : GfxInterface
     MTL::Library *shaderLibrary = nullptr;
     MTL::Function *vertexFunction = nullptr;
     MTL::Function *fragmentFunction = nullptr;
-    MTL::RenderPipelineState *pipelineState = nullptr;
     MTL::DepthStencilState *depthStencilState = nullptr;
     MTL::Buffer *uniformBuffer = nullptr;
     // Persistent depth texture, resized with the drawable. Replaces the
@@ -173,6 +210,50 @@ struct MetalBackend : GfxInterface
     MTL::Texture *depthTexture = nullptr;
     NS::UInteger depthTextureWidth = 0;
     NS::UInteger depthTextureHeight = 0;
+
+    // M3: pipeline cache. The vertex layout (stride + per-attribute offsets)
+    // varies per draw call — the game interleaves VertexTex1Xyzrhw (no
+    // diffuse), VertexTex1DiffuseXyz, VertexTex1DiffuseXyzrhw, and
+    // RenderVertexInfo. Each needs its own baked PSO. We build one PSO per
+    // unique VertexLayoutKey on demand and cache it for the backend's
+    // lifetime. The single PSO baked at Init time in M2 is replaced by this
+    // cache; the first Draw triggers the first build.
+    std::map<VertexLayoutKey, MTL::RenderPipelineState *> pipelineCache;
+
+    // M3: vertex attribute state recorded by SetAttributePointer. Per
+    // attribute we store the CPU pointer (base of the vertex array) and the
+    // stride. The per-attribute offset within a vertex is derived at Draw()
+    // time from the difference between the attribute's ptr and the position
+    // attribute's ptr (all three attributes always share the same vertex
+    // array — they're fields of one struct, so ptr_tex - ptr_pos = texOffset).
+    struct VertexAttribState
+    {
+        void *ptr = nullptr;
+        std::size_t stride = 0;
+    };
+    VertexAttribState attribs[3]{}; // indexed by VertexAttributeArrays
+
+    // M3: persistent vertex buffer. The game passes CPU pointers into
+    // AnmManager's vertex arrays (g_PrimitivesToDraw*, vertexBufferContents,
+    // vertexBuffer). Metal can't read those directly — we copy the requested
+    // slice into a Shared storage mode MTLBuffer at Draw() time. One large
+    // buffer is bumped per frame: each Draw consumes stride*count bytes
+    // starting at frameVertexOffset, and the offset resets at frame open.
+    // Sized for the worst single frame: 98304 verts (AnmManager::vertexBuffer)
+    // * 28 bytes (largest layout) = ~2.75 MB, rounded up.
+    MTL::Buffer *vertexBuffer = nullptr;
+    NS::UInteger vertexBufferSize = 0;
+    NS::UInteger frameVertexOffset = 0;
+
+    // M3: uniform ring. The game updates matrices per sprite (SetTransformMatrix
+    // is called before every Draw), so a single uniforms struct per frame
+    // would desync. We bump-allocate MetalUniforms-sized slices in the same
+    // uniformBuffer: each Draw consumes one slice at frameUniformOffset, the
+    // CPU writes the current `uniforms` into it, and the encoder binds that
+    // slice. Offset resets at frame open. Sized for ~2048 draws per frame.
+    NS::UInteger uniformBufferSize = 0;
+    NS::UInteger frameUniformOffset = 0;
+    static constexpr NS::UInteger kMaxDrawsPerFrame = 2048;
 
     // CPU-side mirror of `uniformBuffer`'s contents. SetXxx() writes here,
     // SwapBuffers() flushes to the GPU buffer (or the GPU reads via shared
@@ -188,8 +269,29 @@ struct MetalBackend : GfxInterface
     // Returns false on any failure; Init() treats that as fatal.
     bool InitPipeline();
 
-    // Copy the CPU-side `uniforms` struct into `uniformBuffer` (Shared storage
-    // mode — contents() is a CPU pointer). Called at frame open and from Init
-    // to seed initial state.
-    void FlushUniforms();
+    // Snapshot the CPU-side `uniforms` struct into the next slot of the
+    // uniform ring buffer (Shared storage mode — contents() is a CPU
+    // pointer), returning the byte offset of the slot. Called once per Draw
+    // so each draw sees its own uniforms (the game updates matrices per
+    // sprite). Also called once at Init to seed slot 0 with defaults.
+    NS::UInteger FlushUniforms();
+
+    // M3: open the per-frame render pass. Acquires the drawable, allocates the
+    // depth texture if needed, bakes pendingClearBits into the load actions,
+    // creates the encoder, and binds the depth-stencil state. Draw calls
+    // happen between BeginFrame and SwapBuffers; SwapBuffers ends encoding and
+    // presents. Idempotent within a frame (safe to call from Clear before any
+    // draw, or from the first Draw if Clear wasn't called).
+    void BeginFrame();
+
+    // M3: build (or fetch from cache) a render pipeline state for the given
+    // vertex layout. Returns nullptr on failure.
+    MTL::RenderPipelineState *GetPipeline(const VertexLayoutKey &key);
+
+    // M3: copy `count` vertices from the CPU pointer recorded by
+    // SetAttributePointer into the persistent vertex buffer, returning the
+    // GPU offset of the copied slice. The base pointer is taken from the
+    // POSITION attribute (always present); the per-attribute offsets are
+    // baked into the PSO via `key`.
+    NS::UInteger CopyVertexData(const VertexLayoutKey &key, i32 start, i32 count);
 };

@@ -31,13 +31,12 @@
 //
 // Binding model:
 //   buffer(0) — MetalUniforms (vertex + fragment stage)
+//   buffer(1) — vertex buffer (vertex stage; stage_in fetches attributes
+//               from this buffer using the offset/stride in the PSO vertex
+//               descriptor). Index 1 avoids the M2 hazard where the vertex
+//               descriptor and the uniform buffer both claimed index 0.
 //   texture(0) — bound texture (fragment stage; M4 populates)
 //   sampler(0) — bound sampler (fragment stage; M4 populates)
-//
-// Vertex attributes (set in the vertex descriptor built in Init()):
-//   attribute(0) — position  float3
-//   attribute(1) — texCoords float2
-//   attribute(2) — diffuse   uchar4 normalized → float4 in shader
 //
 // The frag shader's NO_VERTEX_BUFFER / NO_FOG / USE_FRAG_DEPTH preprocessor
 // branches from the GLSL are translated to the default path (envDiffuse used
@@ -80,6 +79,12 @@ struct VertexOut
     float  viewZ;
 };
 
+// The vertex stage pulls attributes from buffer(1) via the stage_in vertex
+// descriptor (configured per-PSO with the stride/offsets for the current
+// vertex layout); the uniform struct is at buffer(0). The position attribute
+// is float3 but the game's VertexTex1Xyzrhw has a float4 position (xyzw) —
+// the descriptor reads only xyz via Float3, and the shader reconstructs the
+// vec4 with `float4(in.position, 1.0)`.
 vertex VertexOut ff_vertex(VertexIn in [[stage_in]],
                            constant Uniforms &u [[buffer(0)]])
 {
@@ -293,9 +298,12 @@ bool MetalBackend::Init()
     this->uniforms.fogNear = 0.0f;
     this->uniforms.fogFar = 1.0f;
 
-    // Flush the initial uniform values into the GPU buffer so the first frame
-    // has sane state even if the game doesn't set everything before drawing.
+    // Seed the first ring slot with the initial uniform values so the very
+    // first frame's draws (before any SetXxx) have sane state. Reset the
+    // ring offset to 0 afterwards — the first Draw will write slot 0 again
+    // with the actual per-draw uniforms.
     this->FlushUniforms();
+    this->frameUniformOffset = 0;
 
     pool->drain();
     return true;
@@ -313,9 +321,6 @@ bool MetalBackend::InitPipeline()
     NS::AutoreleasePool *pool = NS::AutoreleasePool::alloc()->init();
     bool ok = false;
 
-    MTL::VertexDescriptor *vertexDescriptor = nullptr;
-    MTL::RenderPipelineDescriptor *pipelineDesc = nullptr;
-    NS::Error *pipelineError = nullptr;
     NS::Error *fragCompileError = nullptr;
     MTL::Library *fragLib = nullptr;
 
@@ -381,56 +386,11 @@ bool MetalBackend::InitPipeline()
         goto cleanup;
     }
 
-    // Vertex descriptor — matches VertexIn in the MSL and the vertex format
-    // documented in the goal doc (position float3, texCoords float2, diffuse
-    // unorm4). M3 will wire SetAttributePointer to feed attributes 0/1/2.
-    // alloc()->init() → owned (+1); released in cleanup below.
-    vertexDescriptor = MTL::VertexDescriptor::alloc()->init();
-    vertexDescriptor->attributes()->object(0)->setFormat(MTL::VertexFormatFloat3);
-    vertexDescriptor->attributes()->object(0)->setBufferIndex(0);
-    vertexDescriptor->attributes()->object(0)->setOffset(0);
-    vertexDescriptor->attributes()->object(1)->setFormat(MTL::VertexFormatFloat2);
-    vertexDescriptor->attributes()->object(1)->setBufferIndex(0);
-    // HARDCODED: offset 12 = sizeof(float3). M3 will compute from the vertex
-    // stride/layout recorded by SetAttributePointer.
-    vertexDescriptor->attributes()->object(1)->setOffset(12);
-    vertexDescriptor->attributes()->object(2)->setFormat(MTL::VertexFormatUChar4Normalized);
-    vertexDescriptor->attributes()->object(2)->setBufferIndex(0);
-    // HARDCODED: offset 20 = sizeof(float3) + sizeof(float2). M3 fix.
-    vertexDescriptor->attributes()->object(2)->setOffset(20);
-    // HARDCODED: stride 24 = sizeof(float3)+sizeof(float2)+sizeof(uint32_t).
-    // M3 will set this from SetAttributePointer's stride argument.
-    vertexDescriptor->layouts()->object(0)->setStride(24);
-
-    // Render pipeline descriptor. alloc()->init() → owned (+1); released in
-    // cleanup below.
-    pipelineDesc = MTL::RenderPipelineDescriptor::alloc()->init();
-    pipelineDesc->setVertexFunction(this->vertexFunction);
-    pipelineDesc->setFragmentFunction(this->fragmentFunction);
-    pipelineDesc->setVertexDescriptor(vertexDescriptor);
-    // Color attachment 0 = the drawable's BGRA8Unorm (set on the layer in Init()).
-    pipelineDesc->colorAttachments()->object(0)->setPixelFormat(MTL::PixelFormatBGRA8Unorm);
-    // Default blend off — M5 will configure blend from SetBlendMode.
-    pipelineDesc->setDepthAttachmentPixelFormat(MTL::PixelFormatDepth32Float);
-    // No stencil — EoSD doesn't use stencil.
-    pipelineDesc->setStencilAttachmentPixelFormat(MTL::PixelFormatInvalid);
-    pipelineDesc->setLabel(NS::String::string("th06 ff pipeline", NS::UTF8StringEncoding));
-
-    // newRenderPipelineState returns owned (+1) — released in Exit().
-    this->pipelineState = this->device->newRenderPipelineState(pipelineDesc, &pipelineError);
-    if (this->pipelineState == nullptr)
-    {
-        if (pipelineError != nullptr)
-        {
-            utils::DebugPrint2("MetalBackend: newRenderPipelineState failed: %s",
-                                pipelineError->localizedDescription()->utf8String());
-        }
-        else
-        {
-            utils::DebugPrint2("MetalBackend: newRenderPipelineState failed (no error)");
-        }
-        goto cleanup;
-    }
+    // M3: No PSO is baked here. PSOs are built on demand in GetPipeline()
+    // keyed by VertexLayoutKey, because the game interleaves draws with
+    // different vertex strides/offsets (VertexTex1Xyzrhw, VertexTex1DiffuseXyz,
+    // VertexTex1DiffuseXyzrhw, RenderVertexInfo). InitPipeline only builds
+    // the shaders, depth-stencil state, and persistent buffers.
 
     // Depth-stencil state. EoSD uses LEQUAL depth test with depth write
     // enabled (the game calls SetDepthMask(true) and SetDepthFunc(LEQUAL)
@@ -450,19 +410,37 @@ bool MetalBackend::InitPipeline()
         goto cleanup;
     }
 
-    // Uniform buffer. Shared storage mode = CPU-visible, GPU-readable, no
-    // shared-managed blit needed on unified-memory Apple Silicon. Size is
-    // sizeof(MetalUniforms); the layout in the MSL shader matches via the
-    // explicit struct definition. newBuffer returns owned (+1) — released
-    // in Exit().
-    this->uniformBuffer = this->device->newBuffer(sizeof(MetalUniforms),
+    // M3: Uniform ring buffer. One MetalUniforms slot per potential draw call
+    // this frame. The game updates matrices per sprite, so each Draw needs its
+    // own slice; the CPU writes the current `uniforms` into the slice at
+    // frameUniformOffset and the encoder binds it. Shared storage mode =
+    // CPU-visible, GPU-readable. newBuffer returns owned (+1) — released in
+    // Exit().
+    this->uniformBufferSize = sizeof(MetalUniforms) * kMaxDrawsPerFrame;
+    this->uniformBuffer = this->device->newBuffer(this->uniformBufferSize,
                                                     MTL::ResourceOptionCPUCacheModeDefault);
     if (this->uniformBuffer == nullptr)
     {
         utils::DebugPrint2("MetalBackend: uniform newBuffer failed");
         goto cleanup;
     }
-    this->uniformBuffer->setLabel(NS::String::string("th06 uniforms", NS::UTF8StringEncoding));
+    this->uniformBuffer->setLabel(NS::String::string("th06 uniforms ring", NS::UTF8StringEncoding));
+
+    // M3: Persistent vertex buffer. One large Shared-storage buffer bumped
+    // per frame. The game's largest single draw is AnmManager::vertexBuffer
+    // (98304 verts); at 28 bytes/vert (largest layout) that's ~2.75 MB. Round
+    // up to 4 MB to give headroom for multiple large draws in one frame.
+    this->vertexBufferSize = 4 * 1024 * 1024;
+    this->vertexBuffer = this->device->newBuffer(this->vertexBufferSize,
+                                                  MTL::ResourceOptionCPUCacheModeDefault);
+    if (this->vertexBuffer == nullptr)
+    {
+        utils::DebugPrint2("MetalBackend: vertex newBuffer failed");
+        goto cleanup;
+    }
+    this->vertexBuffer->setLabel(NS::String::string("th06 vertex ring", NS::UTF8StringEncoding));
+    this->frameVertexOffset = 0;
+    this->frameUniformOffset = 0;
 
     // Persistent depth texture — allocated lazily in EnsureDepthTexture on
     // the first frame, when the drawable size is known. M1 allocated a
@@ -475,27 +453,155 @@ bool MetalBackend::InitPipeline()
     ok = true;
 
 cleanup:
-    if (vertexDescriptor != nullptr) vertexDescriptor->release();
-    if (pipelineDesc != nullptr) pipelineDesc->release();
     pool->drain();
     return ok;
 }
 
-// Copy the CPU-side `uniforms` struct into the GPU-visible uniform buffer.
-// Called at frame open (SwapBuffers) and once at Init() to seed the buffer.
-// The buffer is Shared storage mode — contents() returns a CPU pointer we
-// can memcpy into directly. No encoder/blit needed.
-void MetalBackend::FlushUniforms()
+// M3: build (or fetch from cache) a render pipeline state for the given
+// vertex layout. One PSO per unique (stride, positionOffset, texCoordOffset,
+// diffuseOffset). Cached for the backend's lifetime; released in Exit().
+MTL::RenderPipelineState *MetalBackend::GetPipeline(const VertexLayoutKey &key)
+{
+    auto it = this->pipelineCache.find(key);
+    if (it != this->pipelineCache.end())
+    {
+        return it->second;
+    }
+
+    NS::AutoreleasePool *pool = NS::AutoreleasePool::alloc()->init();
+    MTL::RenderPipelineState *pso = nullptr;
+    MTL::VertexDescriptor *vertexDescriptor = nullptr;
+    MTL::RenderPipelineDescriptor *pipelineDesc = nullptr;
+    NS::Error *pipelineError = nullptr;
+
+    // Vertex descriptor — bakes the per-attribute offsets and stride from
+    // `key` into the PSO. All three attributes read from buffer(1) — the
+    // persistent vertex buffer bound at draw time. The position attribute is
+    // Float3 even though some game layouts (VertexTex1Xyzrhw) have a float4
+    // position; Metal reads only the first 3 floats, and the shader
+    // reconstructs the vec4 with w=1.0. The diffuse attribute is
+    // UChar4Normalized — game stores it as a packed 32-bit ColorData.
+    vertexDescriptor = MTL::VertexDescriptor::alloc()->init();
+    vertexDescriptor->attributes()->object(0)->setFormat(MTL::VertexFormatFloat3);
+    vertexDescriptor->attributes()->object(0)->setBufferIndex(kVertexBufferIndex);
+    vertexDescriptor->attributes()->object(0)->setOffset(key.positionOffset);
+    vertexDescriptor->attributes()->object(1)->setFormat(MTL::VertexFormatFloat2);
+    vertexDescriptor->attributes()->object(1)->setBufferIndex(kVertexBufferIndex);
+    vertexDescriptor->attributes()->object(1)->setOffset(key.texCoordOffset);
+    vertexDescriptor->attributes()->object(2)->setFormat(MTL::VertexFormatUChar4Normalized);
+    vertexDescriptor->attributes()->object(2)->setBufferIndex(kVertexBufferIndex);
+    vertexDescriptor->attributes()->object(2)->setOffset(key.diffuseOffset);
+    vertexDescriptor->layouts()->object(kVertexBufferIndex)->setStride(key.stride);
+
+    pipelineDesc = MTL::RenderPipelineDescriptor::alloc()->init();
+    pipelineDesc->setVertexFunction(this->vertexFunction);
+    pipelineDesc->setFragmentFunction(this->fragmentFunction);
+    pipelineDesc->setVertexDescriptor(vertexDescriptor);
+    pipelineDesc->colorAttachments()->object(0)->setPixelFormat(MTL::PixelFormatBGRA8Unorm);
+    // Default blend off — M5 will configure blend from SetBlendMode.
+    pipelineDesc->setDepthAttachmentPixelFormat(MTL::PixelFormatDepth32Float);
+    pipelineDesc->setStencilAttachmentPixelFormat(MTL::PixelFormatInvalid);
+    {
+        char label[96];
+        std::snprintf(label, sizeof(label),
+                      "th06 ff pipeline (stride=%lu pos=%lu tex=%lu diff=%lu)",
+                      (unsigned long)key.stride, (unsigned long)key.positionOffset,
+                      (unsigned long)key.texCoordOffset, (unsigned long)key.diffuseOffset);
+        pipelineDesc->setLabel(NS::String::string(label, NS::UTF8StringEncoding));
+    }
+
+    pso = this->device->newRenderPipelineState(pipelineDesc, &pipelineError);
+    if (pso == nullptr)
+    {
+        if (pipelineError != nullptr)
+        {
+            utils::DebugPrint2("MetalBackend: newRenderPipelineState failed: %s",
+                                pipelineError->localizedDescription()->utf8String());
+        }
+        else
+        {
+            utils::DebugPrint2("MetalBackend: newRenderPipelineState failed (no error)");
+        }
+    }
+    else
+    {
+        this->pipelineCache[key] = pso;
+    }
+
+    if (vertexDescriptor != nullptr) vertexDescriptor->release();
+    if (pipelineDesc != nullptr) pipelineDesc->release();
+    pool->drain();
+    return pso;
+}
+
+// M3: copy `count` vertices from the CPU pointer recorded by
+// SetAttributePointer into the persistent vertex buffer, returning the GPU
+// offset of the copied slice. The base pointer is taken from the POSITION
+// attribute (always present); the per-attribute offsets are baked into the
+// PSO via `key`. The slice is bumped into the ring at frameVertexOffset.
+NS::UInteger MetalBackend::CopyVertexData(const VertexLayoutKey &key, i32 start, i32 count)
+{
+    NS::UInteger bytes = (NS::UInteger)key.stride * (NS::UInteger)count;
+    if (bytes == 0)
+    {
+        return 0;
+    }
+
+    // Bump the ring. If we'd overflow, wrap to 0 — the previous frame's GPU
+    // work has completed by the time we're writing this frame (the command
+    // buffer from the last SwapBuffers was committed and the next drawable
+    // acquired synchronously in BeginFrame). HARDCODED: assumes single-buffer
+    // framing; if we move to double-buffered with <2 frame latency, this
+    // needs a fence.
+    if (this->frameVertexOffset + bytes > this->vertexBufferSize)
+    {
+        this->frameVertexOffset = 0;
+    }
+    NS::UInteger dstOffset = this->frameVertexOffset;
+    this->frameVertexOffset += bytes;
+
+    // The CPU pointer recorded for POSITION is the base of the vertex array.
+    // `start` indexes into it; the per-attribute offsets are baked into the
+    // PSO so we only need to copy the raw vertex bytes here.
+    const u8 *src = (const u8 *)this->attribs[VERTEX_ARRAY_POSITION].ptr
+                    + (std::size_t)start * key.stride;
+    void *dst = (u8 *)this->vertexBuffer->contents() + dstOffset;
+    std::memcpy(dst, src, bytes);
+
+    return dstOffset;
+}
+
+// Copy the CPU-side `uniforms` struct into the GPU-visible uniform buffer at
+// the current frame uniform ring offset, returning the byte offset of the
+// slice. Called once per Draw so each draw sees its own uniforms snapshot
+// (the game updates matrices per sprite). The buffer is Shared storage mode —
+// contents() returns a CPU pointer we can memcpy into directly.
+//
+// At frame open (BeginFrame) the ring offset is reset to 0. Each Draw bumps
+// it by sizeof(MetalUniforms). If we'd overflow the ring, wrap to 0 — the
+// previous frame's GPU work has completed by the time we're writing this
+// frame (the command buffer from the last SwapBuffers was committed and the
+// next drawable acquired synchronously in BeginFrame).
+NS::UInteger MetalBackend::FlushUniforms()
 {
     if (this->uniformBuffer == nullptr)
     {
-        return;
+        return 0;
     }
-    void *gpu = this->uniformBuffer->contents();
+
+    if (this->frameUniformOffset + sizeof(MetalUniforms) > this->uniformBufferSize)
+    {
+        this->frameUniformOffset = 0;
+    }
+    NS::UInteger offset = this->frameUniformOffset;
+    this->frameUniformOffset += sizeof(MetalUniforms);
+
+    void *gpu = (u8 *)this->uniformBuffer->contents() + offset;
     if (gpu != nullptr)
     {
         std::memcpy(gpu, &this->uniforms, sizeof(MetalUniforms));
     }
+    return offset;
 }
 
 // (Re)allocate the persistent depth texture if the drawable size has changed.
@@ -564,14 +670,29 @@ void MetalBackend::Exit()
     }
     this->currentCommandBuffer = nullptr;
     this->currentDrawable = nullptr;
+    if (this->framePool != nullptr)
+    {
+        this->framePool->drain();
+        this->framePool = nullptr;
+    }
 
-    // M2 resources — all owned (+1) from new*/alloc()->init()/Create in
-    // InitPipeline. Release in reverse-of-creation order. Uniform buffer,
-    // depth texture, depth-stencil, pipeline, functions, library.
+    // M2/M3 resources — all owned (+1) from new*/alloc()->init()/Create in
+    // InitPipeline. Release in reverse-of-creation order. Vertex ring buffer,
+    // uniform ring buffer, depth texture, depth-stencil, cached PSOs,
+    // functions, library.
+    if (this->vertexBuffer != nullptr)
+    {
+        this->vertexBuffer->release();
+        this->vertexBuffer = nullptr;
+        this->vertexBufferSize = 0;
+        this->frameVertexOffset = 0;
+    }
     if (this->uniformBuffer != nullptr)
     {
         this->uniformBuffer->release();
         this->uniformBuffer = nullptr;
+        this->uniformBufferSize = 0;
+        this->frameUniformOffset = 0;
     }
     if (this->depthTexture != nullptr)
     {
@@ -585,11 +706,16 @@ void MetalBackend::Exit()
         this->depthStencilState->release();
         this->depthStencilState = nullptr;
     }
-    if (this->pipelineState != nullptr)
+    // M3: release all cached PSOs. Each was created with +1 from
+    // newRenderPipelineState in GetPipeline.
+    for (auto &kv : this->pipelineCache)
     {
-        this->pipelineState->release();
-        this->pipelineState = nullptr;
+        if (kv.second != nullptr)
+        {
+            kv.second->release();
+        }
     }
+    this->pipelineCache.clear();
     if (this->fragmentFunction != nullptr)
     {
         this->fragmentFunction->release();
@@ -660,20 +786,43 @@ void MetalBackend::SetFogColor(ZunColor color)
 
 void MetalBackend::ToggleVertexAttribute(u8 attr, bool enable)
 {
-    // STUB(M3): ToggleVertexAttribute — configure vertex descriptor / pipeline
-    // The vertex descriptor is currently baked into the pipeline at Init time;
-    // M3 will make it dynamic when SetAttributePointer is implemented.
-    (void)attr;
-    (void)enable;
+    // M3: ToggleVertexAttribute maps to the useTexCoords/useDiffuse uniforms
+    // consumed by the fragment shader. The vertex descriptor always wires all
+    // three attributes; when an attribute is "disabled", the shader ignores
+    // the interpolated value because the corresponding flag is 0.
+    //
+    // The GL backend toggles glEnableVertexAttribArray, which matters there
+    // because a disabled attribute reads a constant current value instead of
+    // per-vertex data. In Metal, the attribute is always read per-vertex —
+    // the game ensures the underlying buffer has valid data for the attribute
+    // even when disabled (it always sets the diffuse pointer even when
+    // VERTEX_ATTR_DIFFUSE is off, and the fragment shader gates on the flag).
+    // We match the WebGL backend's uniform mapping exactly.
+    if (attr & VERTEX_ATTR_TEX_COORD)
+    {
+        this->uniforms.useTexCoords = enable ? 1 : 0;
+    }
+    if (attr & VERTEX_ATTR_DIFFUSE)
+    {
+        this->uniforms.useDiffuse = enable ? 1 : 0;
+    }
 }
 
 void MetalBackend::SetAttributePointer(VertexAttributeArrays attr, std::size_t stride, void *ptr)
 {
-    // STUB(M3): SetAttributePointer — record CPU pointer + stride; copy to a
-    // Shared storage mode MTLBuffer at Draw() time.
-    (void)attr;
-    (void)stride;
-    (void)ptr;
+    // M3: record the CPU pointer + stride for this attribute. Draw() derives
+    // the per-attribute offset within a vertex from the difference between
+    // this ptr and the POSITION attribute's ptr (all three attributes are
+    // fields of one struct, so ptr_attr - ptr_pos = attrOffset).
+    //
+    // The game calls SetAttributePointer once per attribute per draw, all
+    // with the same stride. We record each individually; Draw() picks up the
+    // base from VERTEX_ARRAY_POSITION.
+    if ((u32)attr < 3)
+    {
+        this->attribs[attr].ptr = ptr;
+        this->attribs[attr].stride = stride;
+    }
 }
 
 void MetalBackend::SetColorOp(TextureOpComponent component, ColorOp op)
@@ -824,18 +973,109 @@ void MetalBackend::ReadPixels(i32 x, i32 y, i32 width, i32 height, const void *p
 
 void MetalBackend::Draw(PrimitiveType type, i32 start, i32 count)
 {
-    // STUB(M3): Draw — drawPrimitives on render encoder
+    // M3: build a VertexLayoutKey from the recorded attribute state, fetch
+    // (or create) the matching PSO, copy the vertex slice into the persistent
+    // vertex buffer, snapshot the current uniforms into the uniform ring, and
+    // issue a drawPrimitives call. The frame's render pass is opened lazily
+    // by BeginFrame if no encoder is active yet (the game may call Draw
+    // without a prior Clear in some paths).
+    if (this->currentRenderEncoder == nullptr)
+    {
+        this->BeginFrame();
+        if (this->currentRenderEncoder == nullptr)
+        {
+            return;
+        }
+    }
+
+    // Derive the layout key. POSITION is always present and is the base of
+    // the vertex array; the per-attribute offsets come from the byte
+    // difference between each attribute's recorded ptr and POSITION's ptr.
+    // The stride is taken from POSITION (all three SetAttributePointer calls
+    // for one draw use the same stride; we trust POSITION's).
+    VertexAttribState &pos = this->attribs[VERTEX_ARRAY_POSITION];
+    if (pos.ptr == nullptr || pos.stride == 0)
+    {
+        // No position attribute bound — nothing to draw. Defensive; the game
+        // always sets POSITION before Draw.
+        return;
+    }
+
+    VertexLayoutKey key;
+    key.stride = (NS::UInteger)pos.stride;
+    key.positionOffset = 0;
+    key.texCoordOffset = (NS::UInteger)((u8 *)this->attribs[VERTEX_ARRAY_TEX_COORD].ptr
+                                         - (u8 *)pos.ptr);
+    key.diffuseOffset = (NS::UInteger)((u8 *)this->attribs[VERTEX_ARRAY_DIFFUSE].ptr
+                                        - (u8 *)pos.ptr);
+
+    MTL::RenderPipelineState *pso = this->GetPipeline(key);
+    if (pso == nullptr)
+    {
+        return;
+    }
+    this->currentRenderEncoder->setRenderPipelineState(pso);
+
+    // Copy the CPU vertex slice into the persistent vertex buffer and bind
+    // it at buffer index 1 (matches the MSL `stage_in` vertex descriptor).
+    NS::UInteger vertexOffset = this->CopyVertexData(key, start, count);
+    this->currentRenderEncoder->setVertexBuffer(this->vertexBuffer, vertexOffset,
+                                                  kVertexBufferIndex);
+
+    // Snapshot the current uniforms into the ring and bind at buffer index 0
+    // for both vertex and fragment stages. Each Draw gets its own slice so
+    // per-sprite matrix updates don't desync.
+    NS::UInteger uniformOffset = this->FlushUniforms();
+    this->currentRenderEncoder->setVertexBuffer(this->uniformBuffer, uniformOffset, 0);
+    this->currentRenderEncoder->setFragmentBuffer(this->uniformBuffer, uniformOffset, 0);
+
+    // Map the engine primitive type to MTL::PrimitiveType. The game only uses
+    // triangle strip and triangles (see GfxInterface.hpp).
+    MTL::PrimitiveType mtlPrim;
+    switch (type)
+    {
+    case PRIM_TRIANGLE_STRIP:
+        mtlPrim = MTL::PrimitiveTypeTriangleStrip;
+        break;
+    case PRIM_TRIANGLES:
+        mtlPrim = MTL::PrimitiveTypeTriangle;
+        break;
+    default:
+        return;
+    }
+
+    this->currentRenderEncoder->drawPrimitives(mtlPrim, (NS::UInteger)0, (NS::UInteger)count);
 }
 
-void MetalBackend::SwapBuffers()
+// M3: open the per-frame render pass. Acquires the drawable, allocates the
+// depth texture if needed, bakes pendingClearBits into the load actions,
+// creates the encoder, and binds the depth-stencil state. Draw calls happen
+// between BeginFrame and SwapBuffers; SwapBuffers ends encoding and presents.
+//
+// Idempotent within a frame: if called when an encoder is already open, it
+// returns immediately. This makes it safe to call from Clear before any draw,
+// or from the first Draw if Clear wasn't called — the game's frame pattern
+// is Clear(color|depth) at frame start, but some early-init paths draw
+// before the first Clear.
+void MetalBackend::BeginFrame()
 {
-    // M2: open the frame's render pass (clearing with the cached values), bind
-    // the render pipeline + depth-stencil state + uniform buffer, then close
-    // and present. No draws are recorded yet — M3 will land drawPrimitives
-    // between the setRenderPipelineState call and endEncoding. This still
-    // verifies the full present pipeline: nextDrawable -> render pass (clear)
-    // -> bind pipeline -> endEncoding -> presentDrawable -> commit.
-    NS::AutoreleasePool *pool = NS::AutoreleasePool::alloc()->init();
+    if (this->currentRenderEncoder != nullptr)
+    {
+        return;
+    }
+
+    // The frame pool lives for the entire frame — drained in SwapBuffers
+    // after endEncoding. The encoder returned by renderCommandEncoder() is
+    // autoreleased (+0); if we drained a per-function pool here, the encoder
+    // would be released before endEncoding, triggering a validation
+    // assertion. Draining early was the M3 first-pass bug.
+    this->framePool = NS::AutoreleasePool::alloc()->init();
+
+    // Reset the per-frame ring offsets. The previous frame's GPU work has
+    // completed by now — its command buffer was committed in SwapBuffers and
+    // the next drawable acquisition below blocks until a drawable is free.
+    this->frameVertexOffset = 0;
+    this->frameUniformOffset = 0;
 
     // Keep the layer's drawableSize in sync with the window. The game window
     // is fixed-size, but this is cheap and handles fullscreen transitions.
@@ -846,13 +1086,6 @@ void MetalBackend::SwapBuffers()
         this->layer->setDrawableSize(CGSizeMake(w, h));
     }
 
-    // Flush CPU-side uniform updates into the GPU-visible buffer before
-    // encoding. Shared storage mode = no blit needed; the GPU reads the same
-    // memory the CPU just wrote. (If we ever move the uniform buffer to
-    // Managed storage, this is where a blit would go — but Shared is correct
-    // on Apple Silicon unified memory.)
-    this->FlushUniforms();
-
     // Acquire the drawable for this frame. nextDrawable blocks on the CPU
     // until a drawable is available from the pool (max 2 in flight).
     this->currentDrawable = this->layer->nextDrawable();
@@ -860,7 +1093,8 @@ void MetalBackend::SwapBuffers()
     {
         utils::DebugPrint2("MetalBackend: nextDrawable returned null");
         this->pendingClearBits = 0;
-        pool->drain();
+        this->framePool->drain();
+        this->framePool = nullptr;
         return;
     }
 
@@ -868,8 +1102,7 @@ void MetalBackend::SwapBuffers()
     this->currentCommandBuffer->setLabel(NS::String::string("th06 frame", NS::UTF8StringEncoding));
 
     // Reuse the persistent depth texture across frames; (re)allocate if the
-    // drawable size has changed. M1 allocated a throwaway per-frame; M2 keeps
-    // one alive for the backend's lifetime and only reallocates on resize.
+    // drawable size has changed.
     this->EnsureDepthTexture((NS::UInteger)w, (NS::UInteger)h);
 
     MTL::RenderPassDescriptor *desc = MTL::RenderPassDescriptor::renderPassDescriptor();
@@ -879,7 +1112,7 @@ void MetalBackend::SwapBuffers()
     // Color attachment 0 = the drawable's texture. Load=Clear bakes the clear
     // value into the pass; Store=Store writes the result back for presentation.
     // If no color clear was requested this frame, Load=Load preserves prior
-    // contents (M1 always clears color, so this branch is mostly defensive).
+    // contents.
     MTL::RenderPassColorAttachmentDescriptor *colorAtt = desc->colorAttachments()->object(0);
     colorAtt->setTexture(this->currentDrawable->texture());
     if (this->pendingClearBits & CLEAR_COLOR_BUFFER)
@@ -896,10 +1129,10 @@ void MetalBackend::SwapBuffers()
 
     // Depth attachment = persistent depth texture. Even if the game didn't
     // request a depth clear this frame, the attachment must be present for
-    // the depth-stencil state (set on the encoder below) to take effect.
-    // Load=Clear when CLEAR_DEPTH_BUFFER was requested, else Load=Load to
-    // preserve prior contents. Store=DontCare — we never read back the depth
-    // texture, and discarding at pass end saves bandwidth.
+    // the depth-stencil state to take effect. Load=Clear when
+    // CLEAR_DEPTH_BUFFER was requested, else Load=Load. Store=DontCare — we
+    // never read back the depth texture, and discarding at pass end saves
+    // bandwidth.
     if (this->depthTexture != nullptr)
     {
         MTL::RenderPassDepthAttachmentDescriptor *depthAtt = desc->depthAttachment();
@@ -917,52 +1150,66 @@ void MetalBackend::SwapBuffers()
     }
 
     // renderCommandEncoder() returns an autoreleased (+0) object — do NOT
-    // release() it; the frame pool's drain() handles it. Keeping a raw
-    // pointer within pool scope is the correct lifetime model.
+    // release() it; framePool's drain in SwapBuffers handles it. The encoder
+    // is held as a raw pointer across draws until SwapBuffers ends encoding.
     this->currentRenderEncoder = this->currentCommandBuffer->renderCommandEncoder(desc);
     this->currentRenderEncoder->setLabel(NS::String::string("th06 main pass", NS::UTF8StringEncoding));
 
-    // M2: bind the render pipeline, depth-stencil state, and uniform buffer.
-    // No draws are recorded yet (M3), but the encoder is now in a valid state
-    // to receive drawPrimitives calls — the bindings persist for the rest of
-    // the pass.
-    if (this->pipelineState != nullptr)
-    {
-        this->currentRenderEncoder->setRenderPipelineState(this->pipelineState);
-    }
+    // Bind the depth-stencil state once at pass open. The pipeline state is
+    // bound per-Draw in Draw() because it varies with vertex layout.
     if (this->depthStencilState != nullptr)
     {
         this->currentRenderEncoder->setDepthStencilState(this->depthStencilState);
     }
-    if (this->uniformBuffer != nullptr)
+
+    // pendingClearBits was consumed by the load actions above. Reset so
+    // mid-frame Clears after the pass is open don't carry over to next
+    // frame's load actions.
+    this->pendingClearBits = 0;
+
+    // desc is autoreleased (+0); framePool's drain releases it.
+    desc = nullptr;
+}
+
+void MetalBackend::SwapBuffers()
+{
+    // M3: end encoding and present. The render pass was opened in BeginFrame
+    // (called lazily from the first Clear or Draw of the frame). If no draws
+    // happened this frame (e.g. a startup path), BeginFrame is called here
+    // so the clear still applies and a valid frame is presented.
+    if (this->currentRenderEncoder == nullptr)
     {
-        // Bind at buffer index 0 — matches the MSL `buffer(0)` binding on
-        // both vertex and fragment stages.
-        this->currentRenderEncoder->setVertexBuffer(this->uniformBuffer, 0, 0);
-        this->currentRenderEncoder->setFragmentBuffer(this->uniformBuffer, 0, 0);
+        this->BeginFrame();
     }
 
-    this->currentRenderEncoder->endEncoding();
-    this->currentRenderEncoder = nullptr;
+    if (this->currentRenderEncoder != nullptr)
+    {
+        this->currentRenderEncoder->endEncoding();
+        this->currentRenderEncoder = nullptr;
+    }
 
-    // renderPassDescriptor() returns an autoreleased (+0) object — do NOT
-    // release() it; the frame pool's drain() handles it.
-    desc = nullptr;
+    if (this->currentCommandBuffer != nullptr && this->currentDrawable != nullptr)
+    {
+        this->currentCommandBuffer->presentDrawable(this->currentDrawable);
+        this->currentCommandBuffer->commit();
+    }
 
-    this->currentCommandBuffer->presentDrawable(this->currentDrawable);
-    this->currentCommandBuffer->commit();
-
-    // Release per-frame state. The drawable's backing texture is now owned by
-    // the command buffer until it completes; releasing our reference here lets
-    // the layer recycle the drawable.
-    //
-    // commandBuffer() and nextDrawable() both return autoreleased (+0)
-    // objects — do NOT release() them, the frame pool's drain() handles it.
+    // Release per-frame state. commandBuffer() and nextDrawable() both return
+    // autoreleased (+0) objects — do NOT release() them; framePool's drain
+    // handles them.
     this->currentCommandBuffer = nullptr;
     this->currentDrawable = nullptr;
 
-    // Reset for the next frame.
+    // pendingClearBits was consumed by BeginFrame's load actions. Defensive
+    // reset in case BeginFrame was skipped (e.g. nextDrawable failed).
     this->pendingClearBits = 0;
 
-    pool->drain();
+    // Drain the frame pool now that the encoder has been ended. This
+    // releases the autoreleased encoder, command buffer, drawable, and
+    // render pass descriptor captured during BeginFrame.
+    if (this->framePool != nullptr)
+    {
+        this->framePool->drain();
+        this->framePool = nullptr;
+    }
 }
