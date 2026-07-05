@@ -3,6 +3,15 @@
 #include "GfxInterface.hpp"
 #include <SDL2/SDL.h>
 
+// Forward declaration for the metal-cpp NS::UInteger typedef. The full
+// metal-cpp single header is only included in MetalBackend.cpp (it's heavy
+// and pulls in Foundation + Metal + QuartzCore); the header just needs the
+// unsigned int type for the depth texture size members.
+namespace NS
+{
+typedef unsigned long UInteger;
+}
+
 // Forward declarations for metal-cpp types — avoids pulling every Metal header
 // into every TU that includes this file (it's included via GameWindow.cpp).
 namespace MTL
@@ -12,12 +21,42 @@ class CommandQueue;
 class CommandBuffer;
 class RenderCommandEncoder;
 class RenderPassDescriptor;
+class RenderPipelineState;
+class DepthStencilState;
+class DepthStencilDescriptor;
+class RenderPipelineDescriptor;
+class VertexDescriptor;
+class Library;
+class Function;
+class Buffer;
+class Texture;
+class DepthStencilDescriptor;
 }
 namespace CA
 {
 class MetalLayer;
 class MetalDrawable;
 }
+
+// Uniform buffer layout shared between MetalBackend.cpp and the embedded MSL
+// shaders. Bound at buffer index 0 in the render encoder. Std140/PoD —
+// CPU writes into a Shared storage mode MTLBuffer, GPU reads directly.
+//
+// Matches the GLSL ff.vert/ff.frag uniforms (10 logical uniforms collapsed
+// where the GL backend used separate glUniform* calls).
+struct MetalUniforms
+{
+    ZunMatrix modelviewMatrix;       // UNIFORM_MODELVIEW
+    ZunMatrix projectionMatrix;      // UNIFORM_PROJECTION
+    ZunMatrix textureMatrix;         // UNIFORM_TEXTURE_MATRIX
+    ZunVec4   envDiffuse;            // UNIFORM_ENV_DIFFUSE  (SetTextureFactor)
+    ZunVec4   fogColor;              // UNIFORM_FOG_COLOR
+    i32       useTexCoords;          // UNIFORM_TEX_COORD_FLAG (bool as int)
+    i32       useDiffuse;            // UNIFORM_DIFFUSE_FLAG  (bool as int, currently unused by frag shader)
+    i32       colorOp;               // UNIFORM_COLOR_OP (0=MODULATE,1=ADD,2=REPLACE)
+    f32       fogNear;               // UNIFORM_FOG_NEAR
+    f32       fogFar;                // UNIFORM_FOG_FAR
+};
 
 // metal-cpp Metal backend for th06.
 //
@@ -116,4 +155,41 @@ struct MetalBackend : GfxInterface
     // Next texture id to hand out from CreateTexture(). M4 will replace this
     // with a real texture pool keyed by id.
     u32 nextTextureId = 1;
+
+    // ---- M2: persistent pipeline / depth / uniform state ----
+    // Built once in Init() after the device is available. Released in Exit().
+    // The render pipeline bakes vertex layout + shaders + color attachment
+    // format; the depth-stencil state bakes depth test/write/func. The uniform
+    // buffer is the CPU-visible backing for the shader's uniforms struct; the
+    // game updates it piecemeal via SetTransformMatrix/SetFog*/etc.
+    MTL::Library *shaderLibrary = nullptr;
+    MTL::Function *vertexFunction = nullptr;
+    MTL::Function *fragmentFunction = nullptr;
+    MTL::RenderPipelineState *pipelineState = nullptr;
+    MTL::DepthStencilState *depthStencilState = nullptr;
+    MTL::Buffer *uniformBuffer = nullptr;
+    // Persistent depth texture, resized with the drawable. Replaces the
+    // throwaway per-frame allocation in M1's SwapBuffers.
+    MTL::Texture *depthTexture = nullptr;
+    NS::UInteger depthTextureWidth = 0;
+    NS::UInteger depthTextureHeight = 0;
+
+    // CPU-side mirror of `uniformBuffer`'s contents. SetXxx() writes here,
+    // SwapBuffers() flushes to the GPU buffer (or the GPU reads via shared
+    // memory directly). Initialized to identity matrices / sensible defaults
+    // in Init().
+    MetalUniforms uniforms{};
+
+    // Creates (or recreates) the depth texture if the drawable size has
+    // changed since the last call. No-op if the size matches.
+    void EnsureDepthTexture(NS::UInteger width, NS::UInteger height);
+
+    // M2: build shader library + pipeline + depth-stencil + uniform buffer.
+    // Returns false on any failure; Init() treats that as fatal.
+    bool InitPipeline();
+
+    // Copy the CPU-side `uniforms` struct into `uniformBuffer` (Shared storage
+    // mode — contents() is a CPU pointer). Called at frame open and from Init
+    // to seed initial state.
+    void FlushUniforms();
 };
