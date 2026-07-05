@@ -35,6 +35,7 @@ class Buffer;
 class Texture;
 class DepthStencilDescriptor;
 class SamplerState;
+class SamplerDescriptor;
 }
 namespace CA
 {
@@ -190,9 +191,27 @@ struct MetalBackend : GfxInterface
     // Clear(color|depth) sets both, and mid-frame depth-only clears OR in.
     u32 pendingClearBits = 0;
 
-    // Next texture id to hand out from CreateTexture(). M4 will replace this
-    // with a real texture pool keyed by id.
-    u32 nextTextureId = 1;
+    // M4: texture pool. The game uses handle-based texture ids (CreateTexture
+    // returns a GfxTextureHandle wrapping a u32). We hand out ids 1..512 and
+    // index textures[id-1]. An id of 0 means "no texture" (the game's
+    // GfxTextureHandle default-constructs to 0). 512 slots matches the
+    // upper bound of AnmManager's texture array (264) with headroom for
+    // dummy textures created during init.
+    static constexpr u32 kMaxTextures = 512;
+    MTL::Texture *textures[kMaxTextures] = {};
+    MTL::Texture *currentTexture = nullptr;
+    // The handle bound via BindTexture. Tracked separately from
+    // currentTexture because the slot may hold a sentinel (0x1) before
+    // SetTextureImage creates the MTLTexture — in that case currentTexture
+    // is nullptr but we still need the handle to resolve the slot at
+    // SetTextureImage time. 0 means "no texture bound".
+    u32 currentTextureHandle = 0;
+
+    // M4: persistent linear sampler. The game calls SetTextureFilter() once
+    // per CreateTextureObject and only ever requests GL_LINEAR (the GL
+    // backend ignores min filter and uses the default). One sampler state
+    // covers all draws; released in Exit().
+    MTL::SamplerState *samplerState = nullptr;
 
     // ---- M2: persistent pipeline / depth / uniform state ----
     // Built once in Init() after the device is available. Released in Exit().

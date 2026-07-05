@@ -410,6 +410,28 @@ bool MetalBackend::InitPipeline()
         goto cleanup;
     }
 
+    // M4: persistent linear sampler. The game calls SetTextureFilter() once
+    // per CreateTextureObject (matching the GL backend's GL_LINEAR magFilter).
+    // One sampler covers all draws — the game never requests a different
+    // filter. samplerDescriptor returns autoreleased (+0); newSamplerState
+    // returns owned (+1) — released in Exit().
+    {
+        MTL::SamplerDescriptor *samplerDesc = MTL::SamplerDescriptor::alloc()->init();
+        samplerDesc->setSAddressMode(MTL::SamplerAddressModeClampToEdge);
+        samplerDesc->setTAddressMode(MTL::SamplerAddressModeClampToEdge);
+        samplerDesc->setMagFilter(MTL::SamplerMinMagFilterLinear);
+        samplerDesc->setMinFilter(MTL::SamplerMinMagFilterLinear);
+        samplerDesc->setMipFilter(MTL::SamplerMipFilterNotMipmapped);
+        samplerDesc->setLabel(NS::String::string("th06 linear", NS::UTF8StringEncoding));
+        this->samplerState = this->device->newSamplerState(samplerDesc);
+        samplerDesc->release();
+    }
+    if (this->samplerState == nullptr)
+    {
+        utils::DebugPrint2("MetalBackend: newSamplerState failed");
+        goto cleanup;
+    }
+
     // M3: Uniform ring buffer. One MetalUniforms slot per potential draw call
     // this frame. The game updates matrices per sprite, so each Draw needs its
     // own slice; the CPU writes the current `uniforms` into the slice at
@@ -706,6 +728,25 @@ void MetalBackend::Exit()
         this->depthStencilState->release();
         this->depthStencilState = nullptr;
     }
+    // M4: release all live textures + the persistent sampler. Each
+    // MTLTexture in the pool was created with +1 from newTexture in
+    // SetTextureImage. Sentinel slots (0x1) are not real objects — skip.
+    for (u32 i = 0; i < kMaxTextures; i++)
+    {
+        MTL::Texture *tex = this->textures[i];
+        if (tex != nullptr && tex != reinterpret_cast<MTL::Texture *>(0x1))
+        {
+            tex->release();
+        }
+        this->textures[i] = nullptr;
+    }
+    this->currentTexture = nullptr;
+    this->currentTextureHandle = 0;
+    if (this->samplerState != nullptr)
+    {
+        this->samplerState->release();
+        this->samplerState = nullptr;
+    }
     // M3: release all cached PSOs. Each was created with +1 from
     // newRenderPipelineState in GetPipeline.
     for (auto &kv : this->pipelineCache)
@@ -866,7 +907,11 @@ void MetalBackend::SetTransformMatrix(TransformMatrix type, const ZunMatrix &mat
 
 void MetalBackend::SetTextureFilter()
 {
-    // STUB(M4): SetTextureFilter — create/swap sampler state
+    // M4: the persistent linear sampler is created once in InitPipeline.
+    // The game only ever requests GL_LINEAR (see FixedFunctionGL::SetTextureFilter),
+    // so there's nothing to update here — the sampler is already bound at
+    // draw time in Draw(). Kept as a no-op to satisfy the GfxInterface
+    // contract; the actual sampler state lives in this->samplerState.
 }
 
 void MetalBackend::GetViewport(u32 *viewport)
@@ -941,24 +986,245 @@ void MetalBackend::Clear(u32 clearBits)
 
 GfxTextureHandle MetalBackend::CreateTexture()
 {
-    // STUB(M4): CreateTexture — allocate MTLTexture, return id handle
-    GfxTextureHandle handle(this->nextTextureId++);
-    return handle;
+    // M4: hand out a fresh handle id 1..kMaxTextures. The game treats 0 as
+    // "no texture" (GfxTextureHandle default-constructs to 0), so ids start
+    // at 1 and index textures[id-1]. We never reuse ids — the game creates
+    // ~264 textures over its lifetime (AnmManager::textures array size),
+    // well under the 512 slot budget. If we ever exhaust the pool this
+    // returns handle 0, which Draw() treats as "no texture bound".
+    for (u32 i = 0; i < kMaxTextures; i++)
+    {
+        if (this->textures[i] == nullptr)
+        {
+            // Mark the slot as claimed with a sentinel so SetTextureImage
+            // knows it's a live handle even before the MTLTexture is created.
+            // We use a non-null placeholder so a second CreateTexture before
+            // SetTextureImage doesn't hand out the same slot.
+            // Note: the actual MTLTexture is created in SetTextureImage,
+            // since CreateTexture itself has no size/format info.
+            this->textures[i] = reinterpret_cast<MTL::Texture *>(0x1);
+            return GfxTextureHandle(i + 1);
+        }
+    }
+    utils::DebugPrint2("MetalBackend: texture pool exhausted (%u slots)", kMaxTextures);
+    return GfxTextureHandle(0);
 }
 
 void MetalBackend::BindTexture(GfxTextureHandle handle)
 {
-    // STUB(M4): BindTexture — record for next argument table set
+    // M4: record the bound handle. The MTLTexture pointer is resolved at
+    // Draw() time from textures[handle-1] — it may be a sentinel (0x1) if
+    // SetTextureImage hasn't run yet, in which case Draw() binds no texture
+    // and the shader's useTexCoords=0 path falls back to the diffuse color.
+    if (handle == 0 || (u32)handle > kMaxTextures)
+    {
+        this->currentTextureHandle = 0;
+        this->currentTexture = nullptr;
+        return;
+    }
+    this->currentTextureHandle = (u32)handle;
+    MTL::Texture *tex = this->textures[(u32)handle - 1];
+    this->currentTexture = (tex == reinterpret_cast<MTL::Texture *>(0x1)) ? nullptr : tex;
 }
 
 void MetalBackend::DeleteTexture(GfxTextureHandle handle)
 {
-    // STUB(M4): DeleteTexture — release MTLTexture
+    // M4: release the MTLTexture and clear the slot. The slot may still hold
+    // the sentinel (0x1) if SetTextureImage was never called — just clear it.
+    if (handle == 0 || (u32)handle > kMaxTextures)
+    {
+        return;
+    }
+    MTL::Texture *tex = this->textures[(u32)handle - 1];
+    if (tex != nullptr && tex != reinterpret_cast<MTL::Texture *>(0x1))
+    {
+        tex->release();
+    }
+    this->textures[(u32)handle - 1] = nullptr;
+    if (this->currentTexture == tex)
+    {
+        this->currentTexture = nullptr;
+    }
 }
 
-void MetalBackend::SetTextureImage(u32 width, u32 height, PixelFormat fmt, PixelDataType type, const void *data)
+void MetalBackend::SetTextureImage(u32 width, u32 height, PixelFormat fmt, PixelDataType type,
+                                   const void *data)
 {
-    // STUB(M4): SetTextureImage — create texture with pixel format mapping
+    // M4: create (or replace) the MTLTexture for the currently bound handle.
+    // All incoming formats are normalized to RGBA8Unorm on the CPU before
+    // upload — the MSL fragment shader samples texture(0) as float4 and the
+    // PSO color attachment is BGRA8Unorm, so RGBA8 source data maps cleanly.
+    //
+    // The game calls CreateTextureObject() -> CreateTexture + BindTexture +
+    // SetTextureFilter before SetTextureImage, so currentTexture handle is
+    // already claimed (sentinel 0x1 in the slot). We resolve the slot from
+    // the bound handle by scanning — the GL backend doesn't pass the handle
+    // to SetTextureImage, relying on the "currently bound" convention.
+    // Find the slot by matching the sentinel.
+    //
+    // StorageModeShared: CPU-writable via contents(), GPU-readable. On Apple
+    // Silicon unified memory this is zero-copy. Usage ShaderRead — the game
+    // never renders into textures.
+
+    if (width == 0 || height == 0)
+    {
+        return;
+    }
+
+    // Resolve the slot from the bound handle. The game's pattern is
+    // CreateTexture (slot <- sentinel 0x1) -> BindTexture (records handle)
+    // -> SetTextureImage (this function). currentTextureHandle points at
+    // the slot we need to fill. If no handle is bound, bail.
+    if (this->currentTextureHandle == 0)
+    {
+        utils::DebugPrint2("MetalBackend: SetTextureImage with no bound texture");
+        return;
+    }
+    u32 slot = this->currentTextureHandle - 1;
+
+    // Compute source bytes per pixel from the engine's PixelFormat/PixelDataType.
+    // RGB/RGBA with UNSIGNED_BYTE = 3/4 bytes; 16-bit packed types = 2 bytes.
+    u32 srcBpp;
+    bool isPacked16;
+    switch (type)
+    {
+    case PIXEL_UNSIGNED_BYTE:
+        srcBpp = (fmt == PIXEL_RGBA) ? 4 : 3;
+        isPacked16 = false;
+        break;
+    case PIXEL_UNSIGNED_SHORT_5_5_5_1:
+    case PIXEL_UNSIGNED_SHORT_5_6_5:
+    case PIXEL_UNSIGNED_SHORT_4_4_4_4:
+        srcBpp = 2;
+        isPacked16 = true;
+        break;
+    default:
+        utils::DebugPrint2("MetalBackend: SetTextureImage unsupported PixelDataType %d", (int)type);
+        return;
+    }
+
+    // Release any prior MTLTexture in this slot (re-upload path).
+    MTL::Texture *old = this->textures[slot];
+    if (old != nullptr && old != reinterpret_cast<MTL::Texture *>(0x1))
+    {
+        old->release();
+        this->textures[slot] = nullptr;
+    }
+
+    // Allocate the RGBA8 destination texture.
+    MTL::TextureDescriptor *desc = MTL::TextureDescriptor::alloc()->init();
+    desc->setTextureType(MTL::TextureType2D);
+    desc->setPixelFormat(MTL::PixelFormatRGBA8Unorm);
+    desc->setWidth((NS::UInteger)width);
+    desc->setHeight((NS::UInteger)height);
+    // mipLevelCount defaults to 1 in MTL::TextureDescriptor — no setter in
+    // this metal-cpp version. Single-mip is what we want anyway (the game
+    // never generates mipmaps).
+    desc->setStorageMode(MTL::StorageModeShared);
+    desc->setUsage(MTL::TextureUsageShaderRead);
+    MTL::Texture *tex = this->device->newTexture(desc);
+    desc->release();
+    if (tex == nullptr)
+    {
+        utils::DebugPrint2("MetalBackend: newTexture failed (%ux%u)", width, height);
+        this->textures[slot] = nullptr;
+        return;
+    }
+    {
+        char label[64];
+        std::snprintf(label, sizeof(label), "th06 texture #%u (%ux%u RGBA8)",
+                      slot + 1, width, height);
+        tex->setLabel(NS::String::string(label, NS::UTF8StringEncoding));
+    }
+
+    // Convert source pixels to RGBA8 and upload. If data is NULL (the game
+    // uses this for CreateEmptyTexture), skip the upload — the texture is
+    // created with uninitialized memory, which is fine because the game
+    // overwrites it via SetTextureSubImage before sampling.
+    if (data != nullptr)
+    {
+        const u8 *src = (const u8 *)data;
+        NS::UInteger dstRowBytes = (NS::UInteger)width * 4;
+        NS::UInteger srcRowBytes = (NS::UInteger)width * srcBpp;
+
+        // Allocate a conversion buffer for one row. For UNSIGNED_BYTE RGBA
+        // we can upload directly; for everything else convert row-by-row.
+        if (fmt == PIXEL_RGBA && !isPacked16)
+        {
+            // Direct upload — source is already RGBA8.
+            MTL::Region region = MTL::Region::Make2D(0, 0, (NS::UInteger)width, (NS::UInteger)height);
+            tex->replaceRegion(region, 0, src, srcRowBytes);
+        }
+        else
+        {
+            u8 *row = new u8[dstRowBytes];
+            for (u32 y = 0; y < height; y++)
+            {
+                const u8 *srcRow = src + (NS::UInteger)y * srcRowBytes;
+                for (u32 x = 0; x < width; x++)
+                {
+                    u8 *dstPx = row + (NS::UInteger)x * 4;
+                    if (isPacked16)
+                    {
+                        u16 p = (u16)srcRow[(NS::UInteger)x * 2]
+                                | ((u16)srcRow[(NS::UInteger)x * 2 + 1] << 8);
+                        u8 r, g, b, a;
+                        switch (type)
+                        {
+                        case PIXEL_UNSIGNED_SHORT_5_6_5:
+                            r = (p >> 11) & 0x1F; g = (p >> 5) & 0x3F; b = p & 0x1F;
+                            // Replicate high bits into low bits to expand 5/6-bit to 8-bit.
+                            dstPx[0] = (r << 3) | (r >> 2);
+                            dstPx[1] = (g << 2) | (g >> 4);
+                            dstPx[2] = (b << 3) | (b >> 2);
+                            dstPx[3] = 0xFF;
+                            break;
+                        case PIXEL_UNSIGNED_SHORT_5_5_5_1:
+                            r = (p >> 11) & 0x1F; g = (p >> 6) & 0x1F;
+                            b = (p >> 1) & 0x1F; a = p & 0x1;
+                            dstPx[0] = (r << 3) | (r >> 2);
+                            dstPx[1] = (g << 3) | (g >> 2);
+                            dstPx[2] = (b << 3) | (b >> 2);
+                            dstPx[3] = a ? 0xFF : 0x00;
+                            break;
+                        case PIXEL_UNSIGNED_SHORT_4_4_4_4:
+                            r = (p >> 12) & 0xF; g = (p >> 8) & 0xF;
+                            b = (p >> 4) & 0xF; a = p & 0xF;
+                            dstPx[0] = (r << 4) | r;
+                            dstPx[1] = (g << 4) | g;
+                            dstPx[2] = (b << 4) | b;
+                            dstPx[3] = (a << 4) | a;
+                            break;
+                        default:
+                            dstPx[0] = dstPx[1] = dstPx[2] = 0;
+                            dstPx[3] = 0xFF;
+                            break;
+                        }
+                    }
+                    else
+                    {
+                        // PIXEL_RGB, UNSIGNED_BYTE -> RGBA8 (alpha = 0xFF).
+                        dstPx[0] = srcRow[(NS::UInteger)x * 3 + 0];
+                        dstPx[1] = srcRow[(NS::UInteger)x * 3 + 1];
+                        dstPx[2] = srcRow[(NS::UInteger)x * 3 + 2];
+                        dstPx[3] = 0xFF;
+                    }
+                }
+                MTL::Region region = MTL::Region::Make2D(0, (NS::UInteger)y,
+                                                          (NS::UInteger)width, 1);
+                tex->replaceRegion(region, 0, row, dstRowBytes);
+            }
+            delete[] row;
+        }
+    }
+
+    this->textures[slot] = tex;
+    // If the bound handle points at this slot, update currentTexture so
+    // the next Draw picks up the freshly uploaded texture.
+    if (this->currentTexture == nullptr || this->currentTexture == reinterpret_cast<MTL::Texture *>(0x1))
+    {
+        this->currentTexture = tex;
+    }
 }
 
 void MetalBackend::SetTextureSubImage(i32 xoffset, i32 yoffset, i32 width, i32 height, const void *data)
@@ -1028,6 +1294,21 @@ void MetalBackend::Draw(PrimitiveType type, i32 start, i32 count)
     NS::UInteger uniformOffset = this->FlushUniforms();
     this->currentRenderEncoder->setVertexBuffer(this->uniformBuffer, uniformOffset, 0);
     this->currentRenderEncoder->setFragmentBuffer(this->uniformBuffer, uniformOffset, 0);
+
+    // M4: bind the active texture + persistent linear sampler at fragment
+    // stage texture(0)/sampler(0). Matches the MSL `ff_fragment` signature.
+    // If no texture is bound (currentTexture == nullptr), the shader's
+    // useTexCoords=0 path falls back to the diffuse color and texture(0) is
+    // unbound — Metal validation permits unbound textures as long as the
+    // shader doesn't sample them, which the useTexCoords gate enforces.
+    if (this->currentTexture != nullptr)
+    {
+        this->currentRenderEncoder->setFragmentTexture(this->currentTexture, 0);
+    }
+    if (this->samplerState != nullptr)
+    {
+        this->currentRenderEncoder->setFragmentSamplerState(this->samplerState, 0);
+    }
 
     // Map the engine primitive type to MTL::PrimitiveType. The game only uses
     // triangle strip and triangles (see GfxInterface.hpp).
