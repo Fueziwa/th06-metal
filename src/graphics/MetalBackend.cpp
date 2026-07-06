@@ -247,12 +247,14 @@ bool MetalBackend::Init()
     this->layer->setDevice(this->device);
 
     // Configure the CAMetalLayer for presentation. BGRA8Unorm matches the
-    // pipeline color attachment format we'll create in M2. framebufferOnly=YES
-    // enables GPU compression and is fine until ReadPixels (M5) needs readback.
-    // displaySyncEnabled=YES caps presentation to the display refresh rate.
+    // pipeline color attachment format we'll create in M2. framebufferOnly=NO
+    // allows ReadPixels (M5) to sample the drawable texture via getBytes;
+    // the cost is losing some GPU compression on the drawable, which is
+    // negligible at EoSD's 640×480 target. displaySyncEnabled=YES caps
+    // presentation to the display refresh rate.
     this->layer->setPixelFormat(MTL::PixelFormatBGRA8Unorm);
     this->layer->setMaximumDrawableCount(2);
-    this->layer->setFramebufferOnly(true);
+    this->layer->setFramebufferOnly(false);
     this->layer->setDisplaySyncEnabled(true);
     // Note: metal-cpp's CA::MetalLayer binding does not expose setOpaque in
     // this version. The layer is opaque in practice for a fullscreen game;
@@ -392,23 +394,11 @@ bool MetalBackend::InitPipeline()
     // VertexTex1DiffuseXyzrhw, RenderVertexInfo). InitPipeline only builds
     // the shaders, depth-stencil state, and persistent buffers.
 
-    // Depth-stencil state. EoSD uses LEQUAL depth test with depth write
-    // enabled (the game calls SetDepthMask(true) and SetDepthFunc(LEQUAL)
-    // during init). M5 will rebuild this when SetDepthMask/SetDepthFunc are
-    // called; M2 bakes the default.
-    {
-        MTL::DepthStencilDescriptor *depthDesc = MTL::DepthStencilDescriptor::alloc()->init();
-        depthDesc->setDepthCompareFunction(MTL::CompareFunctionLessEqual);
-        depthDesc->setDepthWriteEnabled(true);
-        depthDesc->setLabel(NS::String::string("th06 depth (LEQUAL, write)", NS::UTF8StringEncoding));
-        this->depthStencilState = this->device->newDepthStencilState(depthDesc);
-        depthDesc->release();
-    }
-    if (this->depthStencilState == nullptr)
-    {
-        utils::DebugPrint2("MetalBackend: newDepthStencilState failed");
-        goto cleanup;
-    }
+    // M5: depth-stencil states are now built lazily in GetDepthStencilState,
+    // keyed by (depthWrite, depthCompare). The game toggles SetDepthMask and
+    // SetDepthFunc per sprite group, so caching one state per tuple avoids
+    // rebuilding the descriptor each call. The default state (LEQUAL + write)
+    // is created on the first Draw. InitPipeline no longer bakes one here.
 
     // M4: persistent linear sampler. The game calls SetTextureFilter() once
     // per CreateTextureObject (matching the GL backend's GL_LINEAR magFilter).
@@ -479,10 +469,11 @@ cleanup:
     return ok;
 }
 
-// M3: build (or fetch from cache) a render pipeline state for the given
-// vertex layout. One PSO per unique (stride, positionOffset, texCoordOffset,
-// diffuseOffset). Cached for the backend's lifetime; released in Exit().
-MTL::RenderPipelineState *MetalBackend::GetPipeline(const VertexLayoutKey &key)
+// M3/M5: build (or fetch from cache) a render pipeline state for the given
+// vertex layout + blend configuration. One PSO per unique
+// (stride, positionOffset, texCoordOffset, diffuseOffset, blendMode). Cached
+// for the backend's lifetime; released in Exit().
+MTL::RenderPipelineState *MetalBackend::GetPipeline(const PipelineKey &key)
 {
     auto it = this->pipelineCache.find(key);
     if (it != this->pipelineCache.end())
@@ -519,16 +510,49 @@ MTL::RenderPipelineState *MetalBackend::GetPipeline(const VertexLayoutKey &key)
     pipelineDesc->setVertexFunction(this->vertexFunction);
     pipelineDesc->setFragmentFunction(this->fragmentFunction);
     pipelineDesc->setVertexDescriptor(vertexDescriptor);
-    pipelineDesc->colorAttachments()->object(0)->setPixelFormat(MTL::PixelFormatBGRA8Unorm);
-    // Default blend off — M5 will configure blend from SetBlendMode.
+    MTL::RenderPipelineColorAttachmentDescriptor *colorAtt =
+        pipelineDesc->colorAttachments()->object(0);
+    colorAtt->setPixelFormat(MTL::PixelFormatBGRA8Unorm);
+
+    // M5: blend configuration. Metal bakes blend factors into the PSO's color
+    // attachment — there is no separate blend state object. The game uses two
+    // blend modes (SetBlendMode in AnmManager.cpp:699,704):
+    //   BLEND_INV_SRC_ALPHA -> glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+    //   BLEND_ONE           -> glBlendFunc(GL_SRC_ALPHA, GL_ONE)
+    // blendMode of -1 means blend is disabled (Enable(CAPS_BLEND) was never
+    // called or the default state). When disabled, blending is off and the
+    // fragment shader's output is written directly.
+    if (key.blendMode >= 0)
+    {
+        colorAtt->setBlendingEnabled(true);
+        colorAtt->setSourceRGBBlendFactor(MTL::BlendFactorSourceAlpha);
+        colorAtt->setDestinationRGBBlendFactor(
+            key.blendMode == BLEND_ONE ? MTL::BlendFactorOne
+                                       : MTL::BlendFactorOneMinusSourceAlpha);
+        // Alpha blend: src*srcAlpha + dst*(1-srcAlpha). Matches GL's
+        // default for glBlendFunc when only RGB factors are specified —
+        // GL applies the same factors to alpha unless glBlendFuncSeparate
+        // is used, which EoSD does not.
+        colorAtt->setSourceAlphaBlendFactor(MTL::BlendFactorSourceAlpha);
+        colorAtt->setDestinationAlphaBlendFactor(
+            key.blendMode == BLEND_ONE ? MTL::BlendFactorOne
+                                       : MTL::BlendFactorOneMinusSourceAlpha);
+        colorAtt->setRgbBlendOperation(MTL::BlendOperationAdd);
+        colorAtt->setAlphaBlendOperation(MTL::BlendOperationAdd);
+    }
+    // else: blendingEnabled defaults to false.
+
     pipelineDesc->setDepthAttachmentPixelFormat(MTL::PixelFormatDepth32Float);
     pipelineDesc->setStencilAttachmentPixelFormat(MTL::PixelFormatInvalid);
     {
-        char label[96];
+        char label[112];
+        const char *blendName = (key.blendMode < 0) ? "off"
+                                : (key.blendMode == BLEND_ONE) ? "one" : "invSrcAlpha";
         std::snprintf(label, sizeof(label),
-                      "th06 ff pipeline (stride=%lu pos=%lu tex=%lu diff=%lu)",
+                      "th06 ff pipeline (stride=%lu pos=%lu tex=%lu diff=%lu blend=%s)",
                       (unsigned long)key.stride, (unsigned long)key.positionOffset,
-                      (unsigned long)key.texCoordOffset, (unsigned long)key.diffuseOffset);
+                      (unsigned long)key.texCoordOffset, (unsigned long)key.diffuseOffset,
+                      blendName);
         pipelineDesc->setLabel(NS::String::string(label, NS::UTF8StringEncoding));
     }
 
@@ -556,12 +580,50 @@ MTL::RenderPipelineState *MetalBackend::GetPipeline(const VertexLayoutKey &key)
     return pso;
 }
 
+// M5: build (or fetch from cache) a depth-stencil state for the given
+// (write, compare) tuple. One state per unique combination. Cached for the
+// backend's lifetime; released in Exit().
+MTL::DepthStencilState *MetalBackend::GetDepthStencilState(const DepthStencilKey &key)
+{
+    auto it = this->depthStencilCache.find(key);
+    if (it != this->depthStencilCache.end())
+    {
+        return it->second;
+    }
+
+    NS::AutoreleasePool *pool = NS::AutoreleasePool::alloc()->init();
+    MTL::DepthStencilDescriptor *desc = MTL::DepthStencilDescriptor::alloc()->init();
+    desc->setDepthWriteEnabled(key.depthWriteEnabled);
+    desc->setDepthCompareFunction((MTL::CompareFunction)key.depthCompare);
+    {
+        char label[80];
+        const char *cmpName = (key.depthCompare == MTL::CompareFunctionAlways)  ? "always"
+                              : (key.depthCompare == MTL::CompareFunctionLessEqual) ? "lequal"
+                              : "other";
+        std::snprintf(label, sizeof(label), "th06 depth (%s, %s)",
+                      key.depthWriteEnabled ? "write" : "nowrite", cmpName);
+        desc->setLabel(NS::String::string(label, NS::UTF8StringEncoding));
+    }
+    MTL::DepthStencilState *state = this->device->newDepthStencilState(desc);
+    desc->release();
+    pool->drain();
+    if (state != nullptr)
+    {
+        this->depthStencilCache[key] = state;
+    }
+    else
+    {
+        utils::DebugPrint2("MetalBackend: newDepthStencilState failed");
+    }
+    return state;
+}
+
 // M3: copy `count` vertices from the CPU pointer recorded by
 // SetAttributePointer into the persistent vertex buffer, returning the GPU
 // offset of the copied slice. The base pointer is taken from the POSITION
 // attribute (always present); the per-attribute offsets are baked into the
 // PSO via `key`. The slice is bumped into the ring at frameVertexOffset.
-NS::UInteger MetalBackend::CopyVertexData(const VertexLayoutKey &key, i32 start, i32 count)
+NS::UInteger MetalBackend::CopyVertexData(const PipelineKey &key, i32 start, i32 count)
 {
     NS::UInteger bytes = (NS::UInteger)key.stride * (NS::UInteger)count;
     if (bytes == 0)
@@ -611,12 +673,20 @@ NS::UInteger MetalBackend::FlushUniforms()
         return 0;
     }
 
-    if (this->frameUniformOffset + sizeof(MetalUniforms) > this->uniformBufferSize)
+    // Round the per-draw uniform slice up to a 16-byte boundary. Metal
+    // requires buffer offsets bound at a vertex/fragement stage to be a
+    // multiple of 16; sizeof(MetalUniforms) is 244 (3*64 + 2*16 + 3*4 + 2*4),
+    // so naive bumping produces offsets 244, 488, 732... all of which violate
+    // the alignment. Padding each slice to 256 keeps the ring 16-aligned and
+    // leaves headroom in the slice for future struct growth.
+    static constexpr NS::UInteger kUniformSlice = (sizeof(MetalUniforms) + 15u) & ~NS::UInteger(15u);
+
+    if (this->frameUniformOffset + kUniformSlice > this->uniformBufferSize)
     {
         this->frameUniformOffset = 0;
     }
     NS::UInteger offset = this->frameUniformOffset;
-    this->frameUniformOffset += sizeof(MetalUniforms);
+    this->frameUniformOffset += kUniformSlice;
 
     void *gpu = (u8 *)this->uniformBuffer->contents() + offset;
     if (gpu != nullptr)
@@ -723,11 +793,17 @@ void MetalBackend::Exit()
         this->depthTextureWidth = 0;
         this->depthTextureHeight = 0;
     }
-    if (this->depthStencilState != nullptr)
+    // M5: depth-stencil states are now cached per (write, compare) tuple.
+    // Release all cached entries; each was created with +1 from
+    // newDepthStencilState in GetDepthStencilState.
+    for (auto &kv : this->depthStencilCache)
     {
-        this->depthStencilState->release();
-        this->depthStencilState = nullptr;
+        if (kv.second != nullptr)
+        {
+            kv.second->release();
+        }
     }
+    this->depthStencilCache.clear();
     // M4: release all live textures + the persistent sampler. Each
     // MTLTexture in the pool was created with +1 from newTexture in
     // SetTextureImage. Sentinel slots (0x1) are not real objects — skip.
@@ -916,27 +992,66 @@ void MetalBackend::SetTextureFilter()
 
 void MetalBackend::GetViewport(u32 *viewport)
 {
-    // STUB(M5): GetViewport — return cached viewport (x,y,w,h)
+    // M5: return cached viewport. The game (ZunViewport::Get) reads
+    // viewPortGet[0..3] = (x, y, width, height) and applies its own
+    // GL→D3D y flip math, so we return the raw cached values unchanged.
+    if (viewport != nullptr)
+    {
+        viewport[0] = (u32)this->viewport[0];
+        viewport[1] = (u32)this->viewport[1];
+        viewport[2] = (u32)this->viewport[2];
+        viewport[3] = (u32)this->viewport[3];
+    }
 }
 
 void MetalBackend::GetDepthRange(f32 *depthRange)
 {
-    // STUB(M5): GetDepthRange — return cached near/far
+    // M5: return cached depth range (near, far).
+    if (depthRange != nullptr)
+    {
+        depthRange[0] = this->depthRange[0];
+        depthRange[1] = this->depthRange[1];
+    }
 }
 
 void MetalBackend::SetViewport(i32 x, i32 y, i32 width, i32 height)
 {
-    // STUB(M5): SetViewport — set on render encoder at draw time
+    // M5: cache viewport. The game passes Y in GL bottom-origin convention
+    // (ZunViewport::Set flips Y before calling). We store the raw value and
+    // flip Y to Metal top-origin when applying to the encoder in
+    // ApplyViewport. GetViewport returns the raw cached value so the game's
+    // reverse-flip math works unchanged.
+    this->viewport[0] = x;
+    this->viewport[1] = y;
+    this->viewport[2] = width;
+    this->viewport[3] = height;
+    this->viewportDirty = true;
 }
 
 void MetalBackend::SetDepthRange(f32 nearPlane, f32 farPlane)
 {
-    // STUB(M5): SetDepthRange — setDepthClipPlane on render encoder
+    // M5: cache depth range. Applied to the encoder in ApplyViewport via
+    // setDepthClipPlane (Metal's name for the depth range mapping).
+    this->depthRange[0] = nearPlane;
+    this->depthRange[1] = farPlane;
+    this->viewportDirty = true;
 }
 
 void MetalBackend::Enable(Capabilities cap)
 {
-    // STUB(M5): Enable — translate to depth/blend state on next pipeline
+    // M5: enable-only (GfxInterface has no Disable method). The game calls
+    // Enable(CAPS_BLEND) and Enable(CAPS_DEPTH_TEST) once at init
+    // (GameWindow.cpp:499,505) and never disables them. Set the flag; Draw()
+    // applies it when selecting the PSO blend config and depth-stencil state.
+    switch (cap)
+    {
+    case CAPS_BLEND:
+        this->blendEnabled = true;
+        break;
+    case CAPS_DEPTH_TEST:
+        this->depthTestEnabled = true;
+        break;
+    }
 }
 
 bool MetalBackend::HasError()
@@ -947,17 +1062,28 @@ bool MetalBackend::HasError()
 
 void MetalBackend::SetBlendMode(BlendMode mode)
 {
-    // STUB(M5): SetBlendMode — pipeline blend state
+    // M5: store the requested blend mode. Draw() bakes it into the PSO key
+    // so the right blend configuration is selected from the pipeline cache.
+    // The game toggles between BLEND_INV_SRC_ALPHA (default sprites) and
+    // BLEND_ONE (additive sprite groups) per AnmManager sprite batch
+    // (AnmManager.cpp:699,704).
+    this->currentBlendMode = (i32)mode;
 }
 
 void MetalBackend::SetDepthMask(bool enable)
 {
-    // STUB(M5): SetDepthMask — depth stencil state
+    // M5: store depth-write flag. Draw() combines this with depthFunc and
+    // depthTestEnabled to look up the cached MTL::DepthStencilState.
+    this->depthMaskEnabled = enable;
 }
 
 void MetalBackend::SetDepthFunc(DepthFunc func)
 {
-    // STUB(M5): SetDepthFunc — depth stencil state
+    // M5: store depth-compare function. Draw() maps this to
+    // MTL::CompareFunction when looking up the depth-stencil state:
+    //   DEPTH_FUNC_LEQUAL -> MTL::CompareFunctionLessEqual
+    //   DEPTH_FUNC_ALWAYS -> MTL::CompareFunctionAlways
+    this->depthFunc = (i32)func;
 }
 
 void MetalBackend::SetClearDepth(f32 depth)
@@ -1229,22 +1355,176 @@ void MetalBackend::SetTextureImage(u32 width, u32 height, PixelFormat fmt, Pixel
 
 void MetalBackend::SetTextureSubImage(i32 xoffset, i32 yoffset, i32 width, i32 height, const void *data)
 {
-    // STUB(M5): SetTextureSubImage — blit/replace region
+    // M5: replace a sub-region of the currently bound texture. The game's
+    // only caller (AnmManager::ApplySurfaceToColorBuffer, line 2177) uploads
+    // RGB UNSIGNED_BYTE data into a texture previously created via
+    // SetTextureImage with PIXEL_RGB + UNSIGNED_BYTE (null data). Our
+    // SetTextureImage normalizes all uploads to RGBA8, so the destination
+    // MTLTexture is RGBA8Unorm — we must convert RGB→RGBA8 here too.
+    //
+    // Metal's replaceRegion is a CPU-side blit into the Shared-storage
+    // texture's contents; no encoder needed. The region is clamped to the
+    // texture's bounds by Metal.
+    if (this->currentTexture == nullptr || data == nullptr || width <= 0 || height <= 0)
+    {
+        return;
+    }
+
+    NS::UInteger texWidth = this->currentTexture->width();
+    NS::UInteger texHeight = this->currentTexture->height();
+    if ((NS::UInteger)(xoffset + width) > texWidth || (NS::UInteger)(yoffset + height) > texHeight)
+    {
+        utils::DebugPrint2("MetalBackend: SetTextureSubImage region out of bounds (%d+%d > %lu, %d+%d > %lu)",
+                            xoffset, width, (unsigned long)texWidth,
+                            yoffset, height, (unsigned long)texHeight);
+        return;
+    }
+
+    // Convert RGB8 source → RGBA8 row-by-row. The source stride is width*3;
+    // the destination stride is width*4. replaceRegion takes per-row bytes
+    // for the destination.
+    const u8 *src = (const u8 *)data;
+    NS::UInteger dstRowBytes = (NS::UInteger)width * 4;
+    u8 *row = new u8[dstRowBytes];
+    for (i32 y = 0; y < height; y++)
+    {
+        const u8 *srcRow = src + (NS::UInteger)y * (NS::UInteger)width * 3;
+        for (i32 x = 0; x < width; x++)
+        {
+            u8 *dstPx = row + (NS::UInteger)x * 4;
+            dstPx[0] = srcRow[(NS::UInteger)x * 3 + 0];
+            dstPx[1] = srcRow[(NS::UInteger)x * 3 + 1];
+            dstPx[2] = srcRow[(NS::UInteger)x * 3 + 2];
+            dstPx[3] = 0xFF;
+        }
+        MTL::Region region = MTL::Region::Make2D((NS::UInteger)xoffset,
+                                                  (NS::UInteger)(yoffset + y),
+                                                  (NS::UInteger)width, 1);
+        this->currentTexture->replaceRegion(region, 0, row, dstRowBytes);
+    }
+    delete[] row;
 }
 
 void MetalBackend::ReadPixels(i32 x, i32 y, i32 width, i32 height, const void *pixels)
 {
-    // STUB(M5): ReadPixels — getBytes on drawable texture
+    // M5: read a region of the framebuffer into a CPU buffer. Used for
+    // screenshot/capture-to-texture in AnmManager (line 2087). The game
+    // passes Y in GL bottom-origin convention (the call site already flips
+    // it: `GAME_WINDOW_HEIGHT_REAL - ((top + height) * HEIGHT_RESOLUTION_SCALE)
+    // - VIEWPORT_OFF_Y`). Metal's drawable texture is top-origin, so we flip
+    // Y back to top-origin before reading.
+    //
+    // Strategy (per approved prep decision): end the current render pass,
+    // commit the command buffer and wait for it to complete, then read the
+    // drawable's texture via getBytes. SwapBuffers later presents the same
+    // drawable — the pass will be re-opened by the next Draw or by
+    // SwapBuffers' lazy BeginFrame. Reading mid-frame would require a
+    // blit encoder and a shared staging texture; the end-pass-commit-wait
+    // approach is simpler and matches the screenshot use case (called once
+    // per capture, not per frame).
+    if (pixels == nullptr || width <= 0 || height <= 0 || this->currentDrawable == nullptr)
+    {
+        return;
+    }
+
+    // End any open render pass — getBytes on the drawable texture requires
+    // no encoder is writing to it.
+    if (this->currentRenderEncoder != nullptr)
+    {
+        this->currentRenderEncoder->endEncoding();
+        this->currentRenderEncoder = nullptr;
+    }
+
+    // Commit the pending command buffer (which may contain draws from
+    // earlier in the frame) and wait for the GPU to finish before reading.
+    // The drawable's texture is only valid for CPU read after the commands
+    // writing to it have completed.
+    MTL::CommandBuffer *cmdBuf = this->currentCommandBuffer;
+    if (cmdBuf == nullptr)
+    {
+        // No frame was open — nothing to read.
+        return;
+    }
+
+    // Use a blit encoder to copy the drawable texture into a Shared-storage
+    // staging buffer we can map on the CPU. The drawable texture is
+    // Private-storage (GPU-local); getBytes on a Private texture returns
+    // undefined data. The staging buffer is the supported readback path.
+    NS::UInteger bytesPerRow = (NS::UInteger)width * 4; // RGBA8
+    NS::UInteger byteLength = bytesPerRow * (NS::UInteger)height;
+    MTL::Buffer *staging = this->device->newBuffer(byteLength,
+                                                    MTL::ResourceOptionCPUCacheModeDefault);
+    if (staging == nullptr)
+    {
+        utils::DebugPrint2("MetalBackend: ReadPixels staging buffer alloc failed");
+        return;
+    }
+    staging->setLabel(NS::String::string("th06 readpixels staging", NS::UTF8StringEncoding));
+
+    MTL::BlitCommandEncoder *blit = cmdBuf->blitCommandEncoder();
+    if (blit != nullptr)
+    {
+        blit->setLabel(NS::String::string("th06 readpixels blit", NS::UTF8StringEncoding));
+        // Flip Y from GL bottom-origin to Metal top-origin. The game's Y
+        // argument is measured from the bottom of the window; Metal's
+        // texture origin is the top. The drawable's height is the window's
+        // drawable height.
+        int drawableH = 0;
+        {
+            int dw = 0;
+            SDL_Metal_GetDrawableSize(this->window, &dw, &drawableH);
+        }
+        NS::UInteger metalY = (NS::UInteger)(drawableH - 1 - y - height + 1);
+        MTL::Origin flippedOrigin((NS::UInteger)x, metalY, 0);
+        MTL::Size srcSize((NS::UInteger)width, (NS::UInteger)height, 1);
+        blit->copyFromTexture(this->currentDrawable->texture(),
+                              0, 0, flippedOrigin, srcSize,
+                              staging, 0, bytesPerRow, byteLength);
+        blit->endEncoding();
+    }
+
+    cmdBuf->commit();
+    cmdBuf->waitUntilCompleted();
+
+    // The command buffer and drawable are autoreleased (+0); framePool's
+    // drain in SwapBuffers handles them. Drop our references so the next
+    // SwapBuffers doesn't double-commit.
+    this->currentCommandBuffer = nullptr;
+
+    // Copy + swizzle from the staging buffer (BGRA8, the drawable's format)
+    // to the game's RGBA output buffer. The drawable texture is
+    // PixelFormatBGRA8Unorm; getBytes/replaceRegion byte order matches the
+    // format, so the staging buffer contains B,G,R,A per pixel.
+    const u8 *src = (const u8 *)staging->contents();
+    u8 *dst = (u8 *)pixels;
+    for (i32 row = 0; row < height; row++)
+    {
+        const u8 *srcRow = src + (NS::UInteger)row * bytesPerRow;
+        u8 *dstRow = dst + (NS::UInteger)row * bytesPerRow;
+        for (i32 px = 0; px < width; px++)
+        {
+            u8 b = srcRow[(NS::UInteger)px * 4 + 0];
+            u8 g = srcRow[(NS::UInteger)px * 4 + 1];
+            u8 r = srcRow[(NS::UInteger)px * 4 + 2];
+            u8 a = srcRow[(NS::UInteger)px * 4 + 3];
+            dstRow[(NS::UInteger)px * 4 + 0] = r;
+            dstRow[(NS::UInteger)px * 4 + 1] = g;
+            dstRow[(NS::UInteger)px * 4 + 2] = b;
+            dstRow[(NS::UInteger)px * 4 + 3] = a;
+        }
+    }
+
+    staging->release();
 }
 
 void MetalBackend::Draw(PrimitiveType type, i32 start, i32 count)
 {
-    // M3: build a VertexLayoutKey from the recorded attribute state, fetch
-    // (or create) the matching PSO, copy the vertex slice into the persistent
-    // vertex buffer, snapshot the current uniforms into the uniform ring, and
-    // issue a drawPrimitives call. The frame's render pass is opened lazily
-    // by BeginFrame if no encoder is active yet (the game may call Draw
-    // without a prior Clear in some paths).
+    // M3/M5: build a PipelineKey from the recorded attribute state + current
+    // blend mode, fetch (or create) the matching PSO, copy the vertex slice
+    // into the persistent vertex buffer, snapshot the current uniforms into
+    // the uniform ring, apply viewport + depth-stencil state, and issue a
+    // drawPrimitives call. The frame's render pass is opened lazily by
+    // BeginFrame if no encoder is active yet.
     if (this->currentRenderEncoder == nullptr)
     {
         this->BeginFrame();
@@ -1254,11 +1534,11 @@ void MetalBackend::Draw(PrimitiveType type, i32 start, i32 count)
         }
     }
 
-    // Derive the layout key. POSITION is always present and is the base of
-    // the vertex array; the per-attribute offsets come from the byte
-    // difference between each attribute's recorded ptr and POSITION's ptr.
-    // The stride is taken from POSITION (all three SetAttributePointer calls
-    // for one draw use the same stride; we trust POSITION's).
+    // Derive the layout portion of the key. POSITION is always present and
+    // is the base of the vertex array; the per-attribute offsets come from
+    // the byte difference between each attribute's recorded ptr and
+    // POSITION's ptr. The stride is taken from POSITION (all three
+    // SetAttributePointer calls for one draw use the same stride).
     VertexAttribState &pos = this->attribs[VERTEX_ARRAY_POSITION];
     if (pos.ptr == nullptr || pos.stride == 0)
     {
@@ -1267,13 +1547,26 @@ void MetalBackend::Draw(PrimitiveType type, i32 start, i32 count)
         return;
     }
 
-    VertexLayoutKey key;
+    PipelineKey key;
     key.stride = (NS::UInteger)pos.stride;
     key.positionOffset = 0;
-    key.texCoordOffset = (NS::UInteger)((u8 *)this->attribs[VERTEX_ARRAY_TEX_COORD].ptr
-                                         - (u8 *)pos.ptr);
-    key.diffuseOffset = (NS::UInteger)((u8 *)this->attribs[VERTEX_ARRAY_DIFFUSE].ptr
-                                        - (u8 *)pos.ptr);
+    // When SetAttributePointer wasn't called for TEX_COORD or DIFFUSE before
+    // this Draw, the recorded ptr is nullptr. The vertex descriptor still
+    // declares those attributes as [[stage_in]], so the vertex fetch hardware
+    // reads from whatever offset we set — computing `nullptr - pos.ptr` wraps
+    // to a huge negative value and produces garbage fetches. Point the unused
+    // attribute at offset 0 (the position data, always valid within the
+    // copied slice). The shader's useTexCoords/useDiffuse flags gate the
+    // values at the fragment stage, so reading garbage here is harmless.
+    const void *texPtr = this->attribs[VERTEX_ARRAY_TEX_COORD].ptr;
+    const void *difPtr = this->attribs[VERTEX_ARRAY_DIFFUSE].ptr;
+    key.texCoordOffset = texPtr ? (NS::UInteger)((u8 *)texPtr - (u8 *)pos.ptr) : 0;
+    key.diffuseOffset = difPtr ? (NS::UInteger)((u8 *)difPtr - (u8 *)pos.ptr) : 0;
+    // M5: blend mode in the PSO key. If blend is disabled (Enable was never
+    // called), use -1 so the PSO is built with blendingEnabled=false. The
+    // game toggles SetBlendMode per sprite group; each unique (layout, blend)
+    // tuple gets its own cached PSO.
+    key.blendMode = this->blendEnabled ? this->currentBlendMode : -1;
 
     MTL::RenderPipelineState *pso = this->GetPipeline(key);
     if (pso == nullptr)
@@ -1281,6 +1574,39 @@ void MetalBackend::Draw(PrimitiveType type, i32 start, i32 count)
         return;
     }
     this->currentRenderEncoder->setRenderPipelineState(pso);
+
+    // M5: apply viewport + depth range. No-op if viewportDirty is false and
+    // the viewport hasn't changed. Flips Y from GL bottom-origin to Metal
+    // top-origin.
+    if (this->viewportDirty)
+    {
+        this->ApplyViewport();
+        this->viewportDirty = false;
+    }
+
+    // M5: look up the depth-stencil state for the current
+    // (depthWrite, depthCompare) tuple. When depth test is disabled, use
+    // CompareFunctionAlways + writeEnabled=false (equivalent to GL disabling
+    // the depth test — no compare, no write). When enabled, map the game's
+    // DepthFunc to MTL::CompareFunction.
+    DepthStencilKey dsKey;
+    if (this->depthTestEnabled)
+    {
+        dsKey.depthWriteEnabled = this->depthMaskEnabled;
+        dsKey.depthCompare = (this->depthFunc == DEPTH_FUNC_ALWAYS)
+                                 ? (i32)MTL::CompareFunctionAlways
+                                 : (i32)MTL::CompareFunctionLessEqual;
+    }
+    else
+    {
+        dsKey.depthWriteEnabled = false;
+        dsKey.depthCompare = (i32)MTL::CompareFunctionAlways;
+    }
+    MTL::DepthStencilState *dsState = this->GetDepthStencilState(dsKey);
+    if (dsState != nullptr)
+    {
+        this->currentRenderEncoder->setDepthStencilState(dsState);
+    }
 
     // Copy the CPU vertex slice into the persistent vertex buffer and bind
     // it at buffer index 1 (matches the MSL `stage_in` vertex descriptor).
@@ -1326,6 +1652,44 @@ void MetalBackend::Draw(PrimitiveType type, i32 start, i32 count)
     }
 
     this->currentRenderEncoder->drawPrimitives(mtlPrim, (NS::UInteger)0, (NS::UInteger)count);
+}
+
+// M5: apply the cached viewport + depth range to the current render encoder.
+// The game stores viewport Y in GL bottom-origin convention (ZunViewport::Set
+// flips Y before calling SetViewport). Metal's viewport origin is top-left,
+// so we flip Y = (drawableHeight - y - height). A viewport of {0,0,0,0}
+// means "use the full drawable" — we query SDL for the drawable size and use
+// it directly. Depth range maps to Metal's depth clip plane (near, far).
+void MetalBackend::ApplyViewport()
+{
+    if (this->currentRenderEncoder == nullptr)
+    {
+        return;
+    }
+
+    int drawableW = 0, drawableH = 0;
+    SDL_Metal_GetDrawableSize(this->window, &drawableW, &drawableH);
+
+    MTL::Viewport vp;
+    if (this->viewport[2] > 0 && this->viewport[3] > 0)
+    {
+        // Flip Y from GL bottom-origin to Metal top-origin.
+        vp.originX = (double)this->viewport[0];
+        vp.originY = (double)(drawableH - this->viewport[1] - this->viewport[3]);
+        vp.width   = (double)this->viewport[2];
+        vp.height  = (double)this->viewport[3];
+    }
+    else
+    {
+        // No viewport set — use the full drawable.
+        vp.originX = 0.0;
+        vp.originY = 0.0;
+        vp.width   = (double)drawableW;
+        vp.height  = (double)drawableH;
+    }
+    vp.znear = (double)this->depthRange[0];
+    vp.zfar  = (double)this->depthRange[1];
+    this->currentRenderEncoder->setViewport(vp);
 }
 
 // M3: open the per-frame render pass. Acquires the drawable, allocates the
@@ -1436,12 +1800,9 @@ void MetalBackend::BeginFrame()
     this->currentRenderEncoder = this->currentCommandBuffer->renderCommandEncoder(desc);
     this->currentRenderEncoder->setLabel(NS::String::string("th06 main pass", NS::UTF8StringEncoding));
 
-    // Bind the depth-stencil state once at pass open. The pipeline state is
-    // bound per-Draw in Draw() because it varies with vertex layout.
-    if (this->depthStencilState != nullptr)
-    {
-        this->currentRenderEncoder->setDepthStencilState(this->depthStencilState);
-    }
+    // M5: depth-stencil state is now bound per-Draw in Draw() because it
+    // varies with SetDepthMask/SetDepthFunc/Enable(CAPS_DEPTH_TEST) state.
+    // BeginFrame no longer binds a fixed default state.
 
     // pendingClearBits was consumed by the load actions above. Reset so
     // mid-frame Clears after the pass is open don't carry over to next

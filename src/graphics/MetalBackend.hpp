@@ -73,26 +73,49 @@ static const NS::UInteger kVertexBufferIndex = 1;
 // Uniform buffer binding index (matches `[[buffer(0)]]` in ff_vertex/ff_frag).
 static const NS::UInteger kUniformBufferIndex = 0;
 
-// Signature for a unique vertex layout, used as a PSO cache key. The game
+// Signature for a unique render pipeline, used as a PSO cache key. The game
 // interleaves draws with different strides/offsets (VertexTex1Xyzrhw vs
 // VertexTex1DiffuseXyz vs RenderVertexInfo); a single baked PSO can't service
-// them all. We build one PSO per signature and cache by key.
-struct VertexLayoutKey
+// them all. M5 also bakes the blend configuration into the PSO (Metal has no
+// separate blend state object — blend factors live on the color attachment of
+// the render pipeline descriptor). We build one PSO per (layout, blend) tuple
+// and cache by key.
+struct PipelineKey
 {
     NS::UInteger stride;            // layout(0).stride — bytes between vertices
     NS::UInteger positionOffset;    // attribute(0).offset
     NS::UInteger texCoordOffset;    // attribute(1).offset
     NS::UInteger diffuseOffset;     // attribute(2).offset
+    i32          blendMode;         // BlendMode — see SetBlendMode. -1 = blend disabled.
 };
 
-// Comparator so VertexLayoutKey can key std::map. Identical layout means the
-// PSO built from it is reusable — memcmp semantics on the struct.
-inline bool operator<(const VertexLayoutKey &a, const VertexLayoutKey &b)
+// Comparator so PipelineKey can key std::map. Identical layout + blend means
+// the PSO built from it is reusable — memcmp semantics on the struct.
+inline bool operator<(const PipelineKey &a, const PipelineKey &b)
 {
     if (a.stride != b.stride) return a.stride < b.stride;
     if (a.positionOffset != b.positionOffset) return a.positionOffset < b.positionOffset;
     if (a.texCoordOffset != b.texCoordOffset) return a.texCoordOffset < b.texCoordOffset;
-    return a.diffuseOffset < b.diffuseOffset;
+    if (a.diffuseOffset != b.diffuseOffset) return a.diffuseOffset < b.diffuseOffset;
+    return a.blendMode < b.blendMode;
+}
+
+// Signature for a depth-stencil state. Metal bakes depth test/write/compare
+// into an immutable MTL::DepthStencilState; the game toggles SetDepthMask and
+// SetDepthFunc per sprite group, so we cache one state per (write, compare)
+// tuple. The depth-test-enabled flag is encoded by mapping "disabled" to
+// CompareFunctionAlways with writeEnabled=false (no depth test, no write) —
+// equivalent to GL disabling the depth test.
+struct DepthStencilKey
+{
+    bool depthWriteEnabled;
+    i32  depthCompare; // MTL::CompareFunction value. Always when test disabled.
+};
+
+inline bool operator<(const DepthStencilKey &a, const DepthStencilKey &b)
+{
+    if (a.depthWriteEnabled != b.depthWriteEnabled) return a.depthWriteEnabled < b.depthWriteEnabled;
+    return a.depthCompare < b.depthCompare;
 }
 
 // metal-cpp Metal backend for th06.
@@ -222,7 +245,6 @@ struct MetalBackend : GfxInterface
     MTL::Library *shaderLibrary = nullptr;
     MTL::Function *vertexFunction = nullptr;
     MTL::Function *fragmentFunction = nullptr;
-    MTL::DepthStencilState *depthStencilState = nullptr;
     MTL::Buffer *uniformBuffer = nullptr;
     // Persistent depth texture, resized with the drawable. Replaces the
     // throwaway per-frame allocation in M1's SwapBuffers.
@@ -230,14 +252,45 @@ struct MetalBackend : GfxInterface
     NS::UInteger depthTextureWidth = 0;
     NS::UInteger depthTextureHeight = 0;
 
-    // M3: pipeline cache. The vertex layout (stride + per-attribute offsets)
-    // varies per draw call — the game interleaves VertexTex1Xyzrhw (no
-    // diffuse), VertexTex1DiffuseXyz, VertexTex1DiffuseXyzrhw, and
-    // RenderVertexInfo. Each needs its own baked PSO. We build one PSO per
-    // unique VertexLayoutKey on demand and cache it for the backend's
-    // lifetime. The single PSO baked at Init time in M2 is replaced by this
-    // cache; the first Draw triggers the first build.
-    std::map<VertexLayoutKey, MTL::RenderPipelineState *> pipelineCache;
+    // M3/M5: pipeline cache. The vertex layout (stride + per-attribute
+    // offsets) and the blend mode vary per draw call — the game interleaves
+    // VertexTex1Xyzrhw (no diffuse), VertexTex1DiffuseXyz,
+    // VertexTex1DiffuseXyzrhw, and RenderVertexInfo, and toggles
+    // BLEND_INV_SRC_ALPHA vs BLEND_ONE per sprite group. Each (layout, blend)
+    // tuple needs its own baked PSO. We build one PSO per unique PipelineKey
+    // on demand and cache it for the backend's lifetime. The single PSO baked
+    // at Init time in M2 is replaced by this cache; the first Draw triggers
+    // the first build.
+    std::map<PipelineKey, MTL::RenderPipelineState *> pipelineCache;
+
+    // M5: depth-stencil state cache. One entry per (depthWrite, depthCompare)
+    // tuple actually requested by the game via SetDepthMask/SetDepthFunc.
+    // Built lazily in GetDepthStencilState; released in Exit().
+    std::map<DepthStencilKey, MTL::DepthStencilState *> depthStencilCache;
+
+    // M5: cached render state. The game calls Set* spread out across a frame
+    // (SetBlendMode/SetDepthMask/SetDepthFunc per sprite group, SetViewport/
+    // SetDepthRange per camera). We store the raw values here and apply them
+    // at Draw() time. Blend mode of -1 means "blend disabled" (Enable was
+    // never called for CAPS_BLEND, or the default). Depth test enabled flag
+    // is separate from depth compare function — when disabled, the state
+    // applied is CompareFunctionAlways + writeEnabled=false.
+    i32 currentBlendMode = -1;          // BlendMode or -1 (disabled)
+    bool blendEnabled = false;          // set by Enable(CAPS_BLEND)
+    bool depthTestEnabled = false;      // set by Enable(CAPS_DEPTH_TEST)
+    bool depthMaskEnabled = true;       // set by SetDepthMask (default true)
+    i32  depthFunc = 0;                 // DEPTH_FUNC_* — maps to MTL::CompareFunction
+
+    // M5: viewport + depth range cache. The game passes viewport Y in GL
+    // bottom-origin convention (ZunViewport::Set flips Y before calling
+    // SetViewport); we store the raw values and flip Y to Metal top-origin
+    // when applying to the encoder at Draw time. GetViewport returns the raw
+    // cached values so the game's reverse-flip math in ZunViewport::Get works
+    // unchanged. A viewport of {0,0,0,0} means "use the full drawable" — we
+    // apply the drawable size in that case.
+    i32 viewport[4] = {0, 0, 0, 0};     // x, y, width, height (GL Y convention)
+    f32 depthRange[2] = {0.0f, 1.0f};   // near, far
+    bool viewportDirty = true;          // apply on next Draw when true
 
     // M3: vertex attribute state recorded by SetAttributePointer. Per
     // attribute we store the CPU pointer (base of the vertex array) and the
@@ -303,14 +356,23 @@ struct MetalBackend : GfxInterface
     // draw, or from the first Draw if Clear wasn't called).
     void BeginFrame();
 
-    // M3: build (or fetch from cache) a render pipeline state for the given
-    // vertex layout. Returns nullptr on failure.
-    MTL::RenderPipelineState *GetPipeline(const VertexLayoutKey &key);
+    // M3/M5: build (or fetch from cache) a render pipeline state for the
+    // given vertex layout + blend configuration. Returns nullptr on failure.
+    MTL::RenderPipelineState *GetPipeline(const PipelineKey &key);
+
+    // M5: build (or fetch from cache) a depth-stencil state for the given
+    // (write, compare) tuple. Returns nullptr on failure.
+    MTL::DepthStencilState *GetDepthStencilState(const DepthStencilKey &key);
 
     // M3: copy `count` vertices from the CPU pointer recorded by
     // SetAttributePointer into the persistent vertex buffer, returning the
     // GPU offset of the copied slice. The base pointer is taken from the
     // POSITION attribute (always present); the per-attribute offsets are
     // baked into the PSO via `key`.
-    NS::UInteger CopyVertexData(const VertexLayoutKey &key, i32 start, i32 count);
+    NS::UInteger CopyVertexData(const PipelineKey &key, i32 start, i32 count);
+
+    // M5: apply cached viewport + depth range to the render encoder. Flips
+    // Y from GL bottom-origin to Metal top-origin. No-op if the viewport
+    // is {0,0,0,0} (use full drawable) and depth range is default.
+    void ApplyViewport();
 };
